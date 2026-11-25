@@ -104,15 +104,30 @@ impl Platform for Phone {
         })
     }
 
-    fn save_file(&self, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+    fn save_file(&self, name: &str, bytes: Vec<u8>, project: bool) -> Result<(), String> {
         self.java(|env, activity| {
             let name = env.new_string(name)?;
             let bytes = env.byte_array_from_slice(&bytes)?;
             env.call_method(
                 activity,
                 jni_str!("save"),
-                jni_sig!((name: JString, bytes: [jbyte]) -> void),
-                &[JValue::Object(&name), JValue::Object(&bytes)],
+                jni_sig!((name: JString, bytes: [jbyte], project: boolean) -> void),
+                &[JValue::Object(&name), JValue::Object(&bytes), JValue::Bool(project)],
+            )?
+            .v()
+        })
+    }
+
+    fn write_back(&self, document: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+        self.java(|env, activity| {
+            let document = env.new_string(document)?;
+            let name = env.new_string(name)?;
+            let bytes = env.byte_array_from_slice(&bytes)?;
+            env.call_method(
+                activity,
+                jni_str!("writeBack"),
+                jni_sig!((document: JString, name: JString, bytes: [jbyte]) -> void),
+                &[JValue::Object(&document), JValue::Object(&name), JValue::Object(&bytes)],
             )?
             .v()
         })

@@ -10,8 +10,11 @@
 //!    written as the file holds them, not as an older read held them.
 //! 2. The file as it was read, written again the same way, holds what the file holds: the same
 //!    shapes (no Z or M values dropped, none left out), the same columns and the same values,
-//!    compared as the bytes the `.dbf` holds, not as read (text a read trims, a code page's
-//!    characters). Whatever a read and write of the file loses shows here, before the edits.
+//!    compared as the `.dbf` holds them, not as read: the column descriptors byte for byte, and
+//!    text cells too but for the padding after them (text a read trims, a code page's
+//!    characters); numbers by value (`003.50` is `3.5`, `-0` is `0`), logicals by meaning (`Y`,
+//!    `1` and `T` are one true, `N`, `0` and `F` one false) and a zero date as a blank one.
+//!    Whatever a read and write of the file loses shows here, before the edits.
 //! 3. The layer, written, reads back as the layer: every value and shape the edits made fits.
 //!
 //! A shape that wasn't edited is written with the coordinates the file holds, not converted to
@@ -48,6 +51,9 @@ pub struct Published {
     pub read: Dataset,
     /// Digest of `read`, computed before placement so cancellation cannot interrupt completion.
     pub rows: u64,
+    /// Its [`crate::sync::native_digest`] when it is held in a system of its own
+    /// ([`crate::sync::Synced::native`]).
+    pub native: Option<u64>,
     pub features: usize,
     pub notes: Vec<String>,
 }
@@ -235,7 +241,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
             format!("{} of its records are marked deleted, and writing it again would remove them from the file", table.deleted),
         ));
     }
-    let mut encoding_notes = Vec::new();
+    let mut encoding_notes = crate::loss::Notes::new();
     let ldid = original.dbf.get(29).copied().unwrap_or(0);
     let style = DbfStyle {
         encoding: crate::dbf::encoding(original.cpg.as_ref().map(|(_, b)| b.as_slice()), ldid, &mut encoding_notes),
@@ -245,18 +251,18 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     // A code page RustGIS can't write (one it reads as UTF-8 for want of a decoder): edited text
     // would be written in UTF-8 under the file's language driver.
     if let Some(note) = encoding_notes.first() {
-        return Err(refused(path, format!("{note}, so its text can't be written in its own code page")));
+        return Err(refused(path, format!("{}, so its text can't be written in its own code page", note.as_str())));
     }
 
     // 1. It reads as the layer was read: in the layer's system, and in the file's own
     // coordinates (the system taken for longitude/latitude, which converts nothing).
     let (as_read, _) = crate::io::read_shapefile_parts(original.parts(), &name, ds.crs)?;
-    if crate::sync::rows_digest(&as_read)? != synced.rows {
+    if synced.digest_of(&as_read)? != synced.digest() {
         // Define Projection changes the layer's CRS, which is part of its digest. The
         // unedited file must still reproduce the saved baseline in its own CRS. Keep the
         // current-CRS read above for imports with an override and native-coordinate reuse.
         let (baseline, _) = crate::io::read_shapefile_parts(original.parts(), &name, None)?;
-        if crate::sync::rows_digest(&baseline)? != synced.rows {
+        if synced.digest_of(&baseline)? != synced.digest() {
             return Err(refused(
                 path,
                 "it reads otherwise now than at the saved sync point, even in the file's own coordinate system; the import CRS may differ or RustGIS may read it more fully now: restore the original import CRS or add the file again with the intended CRS",
@@ -300,13 +306,27 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         cpg: original.cpg.as_ref().map(|(_, b)| b.clone()),
     };
     let (read_back, _) = crate::io::read_shapefile_parts(back, &name, crs)?;
-    if let Some(why) = same_rows(ds, &read_back, if crs.is_some() { PROJECTED_TOLERANCE } else { 0.0 }) {
+    // Compared as they are when the layer holds its coordinates in the system the file is read
+    // back in (its own): written unconverted, they read back exactly. Otherwise both in
+    // longitude/latitude, so compared alike whatever systems the two hold them in.
+    fn lonlat<'d>(d: &'d Dataset, path: &Path) -> Result<std::borrow::Cow<'d, Dataset>> {
+        d.in_lonlat().map_err(|e| match DataError::of_conversion(e) {
+            DataError::Format(e) => refused(path, e),
+            cancelled => cancelled,
+        })
+    }
+    let systems_differ = ds.coord_crs() != read_back.coord_crs();
+    let (layer, back) = if systems_differ {
+        (lonlat(ds, path)?, lonlat(&read_back, path)?)
+    } else {
+        (std::borrow::Cow::Borrowed(ds), std::borrow::Cow::Borrowed(&read_back))
+    };
+    let projected = crs.is_some() && systems_differ;
+    if let Some(why) = same_rows(&layer, &back, if projected { PROJECTED_TOLERANCE } else { 0.0 }) {
         return Err(refused(path, format!("the file couldn't hold the layer as it is: {why}")));
     }
 
-    if crs.is_some()
-        && let Some(note) = projection_note(ds, &read_back)?
-    {
+    if projected && let Some(note) = projection_note(&layer, &back)? {
         notes.push(format!("{}: {note}", path.display()));
     }
 
@@ -378,7 +398,7 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
     if let Some((cpg, bytes)) = &original.cpg {
         targets.push((cpg.clone(), bytes.clone()));
     }
-    let rows = crate::sync::rows_digest(&read_back)?;
+    let (rows, native) = crate::sync::digests(&read_back)?;
     // The record of the files as they will be, made before any is placed: once they are, the
     // publish has happened, whatever comes after.
     let files = FileSync::of_written(path, &targets)?;
@@ -397,20 +417,49 @@ pub fn shapefile(ds: &Dataset, path: &Path, synced: &Synced) -> Result<Published
         crate::io::unstage(&staged);
         return Err(e);
     }
-    crate::io::place_shapefile(path, &staged)?;
-    Ok(Published { files, read: read_back, rows, features: ds.features.len(), notes })
+    let kept = crate::io::place_shapefile(path, &staged)?;
+    notes.extend(crate::io::kept_backups_note(path, &kept));
+    Ok(Published { files, read: read_back, rows, native, features: ds.features.len(), notes })
 }
 
-/// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude, as it is held). Given
-/// the file as read and in its own coordinates (`as_held`, the same rows), a feature whose shape
-/// is the one read takes the file's coordinates as they are; any other is projected. A native
-/// shape that failed conversion is refused: missing geometry cannot identify its source shape.
+/// `ds` in the file's coordinate system `crs` (`None`: longitude/latitude), from the system it
+/// holds its coordinates in ([`Dataset::coord_crs`]). Given the file as read and in its own
+/// coordinates (`as_held`, the same rows), a feature of a layer held in longitude/latitude whose
+/// shape is the one read takes the file's coordinates as they are; any other is projected. A native
+/// shape the read left without geometry is refused: missing geometry cannot identify its source
+/// shape.
 fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Dataset)>) -> Result<std::borrow::Cow<'a, Dataset>> {
-    let Some(c) = crs else { return Ok(std::borrow::Cow::Borrowed(ds)) };
-    let t = Crs::LonLat.to(c).map_err(DataError::Format)?;
-    let (read, raw): (Vec<&Feature>, Vec<&Feature>) = match as_held {
-        Some((read, raw)) => (read.features.iter().collect(), raw.features.iter().collect()),
-        None => (Vec::new(), Vec::new()),
+    // A native shape the read left without geometry (a coordinate that isn't a number; one with
+    // no place in longitude/latitude is kept, #2032 C2f-4b) can't be told apart from a feature
+    // without one, whatever system the layer holds its coordinates in.
+    if let Some((read, raw)) = as_held {
+        for (i, (f, r)) in read.features.iter().zip(raw.features.iter()).enumerate() {
+            crate::progress::check()?;
+            if f.geometry.is_none() && r.geometry.is_some() {
+                return Err(DataError::Format(format!(
+                    "source shape {} was read without its geometry (a coordinate that isn't a number), so its native geometry can't be matched safely; add the file again; nothing was written",
+                    i + 1
+                )));
+            }
+        }
+    }
+    // From the system the layer holds its coordinates in: as they are when that is the file's.
+    let (c, from) = (crs.unwrap_or(Crs::LonLat), ds.coord_crs());
+    if c == from {
+        return Ok(std::borrow::Cow::Borrowed(ds));
+    }
+    let t = from.to(c).map_err(DataError::Format)?;
+    // The file as read is matched by its longitude/latitude: only a layer held in them is.
+    let as_held = as_held.filter(|_| from == Crs::LonLat);
+    // The file as read, in longitude/latitude as the layer reads it (converted from the file's
+    // own system by the conversion that gave the layer its copy).
+    let read_in_lonlat = match as_held {
+        Some((read, _)) => Some(read.in_lonlat().map_err(DataError::of_conversion)?),
+        None => None,
+    };
+    let (read, raw): (Vec<&Feature>, Vec<&Feature>) = match (&read_in_lonlat, as_held) {
+        (Some(read), Some((_, raw))) => (read.features.iter().collect(), raw.features.iter().collect()),
+        _ => (Vec::new(), Vec::new()),
     };
     // File reads number rows anew; persistent layer ids can have gaps after a deletion.
     // Exact geometry keys retain correspondence without trusting those regenerated ids.
@@ -418,12 +467,6 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
     let mut at: std::collections::HashMap<Vec<u8>, (usize, bool)> = std::collections::HashMap::new();
     for (i, f) in read.iter().enumerate() {
         crate::progress::check()?;
-        if f.geometry.is_none() && raw.get(i).is_some_and(|f| f.geometry.is_some()) {
-            return Err(DataError::Format(format!(
-                "source shape {} couldn't be converted to longitude/latitude, so its native geometry can't be matched safely; check the source projection and add the file again; nothing was written",
-                i + 1
-            )));
-        }
         at.entry(key(f)?)
             .and_modify(|(first, ambiguous)| *ambiguous |= raw.get(*first).zip(raw.get(i)).is_some_and(|(a, b)| a.geometry != b.geometry))
             .or_insert((i, false));
@@ -447,6 +490,7 @@ fn in_file<'a>(ds: &'a Dataset, crs: Option<Crs>, as_held: Option<(&Dataset, &Da
     }
     let mut out = ds.clone();
     out.features = rows.into();
+    out.held_in = c;
     Ok(std::borrow::Cow::Owned(out))
 }
 
@@ -778,6 +822,22 @@ mod tests {
     use super::*;
     use crate::{Coord, Field, GeometryType};
 
+    /// A layer held in the file's own system (#2032 C2) is written as it is held; one held in
+    /// another is converted from it, without matching the file as read in longitude/latitude.
+    #[test]
+    fn a_layer_held_in_the_files_system_is_written_as_it_is() {
+        let (utm, etrs) = (Crs::Epsg(32632), Crs::Epsg(25832));
+        let at = Coord::new(500_000.0, 5_400_000.0);
+        let mut ds = Dataset::new("held", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(at)), vec![]);
+        ds.held_in = utm;
+        let same = in_file(&ds, Some(utm), None).unwrap();
+        assert!(matches!(same, std::borrow::Cow::Borrowed(_)));
+        let other = in_file(&ds, Some(etrs), Some((&ds, &ds))).unwrap();
+        assert_eq!(other.features[0].geometry, Some(Geometry::Point(utm.to(etrs).unwrap().point(at).unwrap())));
+        assert_eq!(other.coord_crs(), etrs);
+    }
+
     /// A small polygon layer of parcels with an owner, an area with decimals and a count.
     fn parcels() -> Dataset {
         let mut ds = Dataset::new(
@@ -809,7 +869,7 @@ mod tests {
     fn read(path: &Path) -> (Dataset, Synced) {
         let (read, files) = FileSync::around(path, || crate::io::read_path(path).unwrap()).unwrap();
         let rows = crate::sync::rows_digest(&read.0).unwrap();
-        (read.0, Synced { files: files.unwrap(), rows })
+        (read.0, Synced { files: files.unwrap(), rows, native: None })
     }
 
     /// An edit is written back: the file reads as the layer, keeps its columns and `.prj`, and
@@ -1153,7 +1213,7 @@ mod tests {
         ds.features = rows.into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         assert_eq!(published.read.features.iter().next().unwrap().attrs[0], Value::Null);
-        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap() };
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap(), native: None };
         let mut ds = published.read;
         let mut rows: Vec<_> = ds.features.iter().cloned().collect();
         rows[1].attrs[0] = Value::Text("Jonas".into());
@@ -1234,7 +1294,7 @@ mod tests {
         ds.features = rows.clone().into();
         let published = shapefile(&ds, &path, &sync).unwrap();
         // The record of what was published, as the layer takes it.
-        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap() };
+        let synced = Synced { files: published.files, rows: crate::sync::rows_digest(&published.read).unwrap(), native: None };
         let dbf = std::fs::read(path.with_extension("dbf")).unwrap();
         assert!(dbf.windows(5).any(|w| w == b"Mu\xf1oz"), "written in Windows-1252");
         assert_eq!(std::fs::read(path.with_extension("cpg")).unwrap(), b"1252");
@@ -1380,7 +1440,7 @@ mod tests {
         assert_eq!(published.read.fields[1].ty, FieldType::Double);
         assert_eq!(published.read.features.first().unwrap().attrs[1], Value::Float(100.0));
         assert!(published.notes.is_empty(), "{:?}", published.notes);
-        let again = shapefile(&published.read, &path, &Synced { files: published.files, rows: published.rows }).unwrap();
+        let again = shapefile(&published.read, &path, &Synced { files: published.files, rows: published.rows, native: None }).unwrap();
         assert!(again.notes.is_empty(), "{:?}", again.notes);
     }
 
@@ -1459,9 +1519,10 @@ mod tests {
         }
     }
 
-    /// An unconverted source shape cannot supply geometry to a new geometry-less feature.
+    /// A source shape with no place in longitude/latitude is read as the file holds it (#2032
+    /// C2f-4b), so a publish of an attribute edit writes it back unchanged, to the bit.
     #[test]
-    fn an_unconverted_shape_cannot_be_copied_to_a_geometryless_feature() {
+    fn a_shape_with_no_longitude_latitude_place_is_written_back_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("parcels.shp");
         let mut native = Dataset::new("parcels", GeometryType::Point, vec![Field::new("OWNER", FieldType::Text)]);
@@ -1471,11 +1532,15 @@ mod tests {
         let crs = Crs::parse("EPSG:32616").unwrap();
         std::fs::write(path.with_extension("prj"), crate::raster::wkt::to_wkt(crs).unwrap()).unwrap();
         let (mut ds, sync) = read(&path);
-        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 1);
-        ds.push(None, vec![Value::Text("new".into())]);
-        let error = shapefile(&ds, &path, &sync).err().expect("unconverted shapes must not be assigned to new features").to_string();
-        assert!(error.contains("source shape 1") && error.contains("converted") && error.contains("nothing was written"), "{error}");
-        assert!(sync.files.changed(&path).unwrap().is_empty());
+        assert_eq!(ds.features.iter().filter(|f| f.geometry.is_none()).count(), 0);
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[1].attrs[0] = Value::Text("edited".into());
+        ds.features = rows.into();
+        shapefile(&ds, &path, &sync).unwrap();
+        let (back, _) = read(&path);
+        let shapes: Vec<Option<Geometry>> = back.features.iter().map(|f| f.geometry.clone()).collect();
+        assert_eq!(shapes, [Some(Geometry::Point(Coord::new(1e30, 1e30))), Some(Geometry::Point(Coord::new(500_000.0, 0.0)))]);
+        assert_eq!(back.features.row(1).unwrap().value(0), &Value::Text("edited".into()));
     }
 
     /// After deletion, persistent layer ids differ from file row numbers. An attribute-only
@@ -1496,7 +1561,7 @@ mod tests {
         rows[0].id = id;
         rows[0].attrs[0] = Value::Text("Smyth".into());
         ds.features = rows.into();
-        let sync = Synced { files: published.files, rows: published.rows };
+        let sync = Synced { files: published.files, rows: published.rows, native: None };
         let before = std::fs::read(&path).unwrap();
         shapefile(&ds, &path, &sync).unwrap();
         assert!(same_shapes(&before, &std::fs::read(&path).unwrap(), 0.0).is_none());
@@ -1540,6 +1605,25 @@ mod tests {
         assert!(published.notes[0].contains("'OWNER' C(5) to C(24)"), "{:?}", published.notes);
         let (back, _) = crate::io::read_path(&path).unwrap();
         assert_eq!(back.features.iter().next().unwrap().attrs[0], Value::Text("Smith and Jones Holdings".into()));
+    }
+
+    /// A layer held in the file's system (#2032 C2) is compared with what the file reads back as
+    /// in longitude/latitude, not its metres with degrees: an edit of its table is written.
+    #[test]
+    fn a_layer_held_in_the_files_system_publishes_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parcels.shp");
+        let crs = Crs::parse("EPSG:32616").unwrap();
+        crate::io::write_path_in(&parcels(), &path, crs).unwrap();
+        let (mut ds, sync) = read(&path);
+        ds.hold_in(crs).unwrap();
+        let mut rows: Vec<_> = ds.features.iter().cloned().collect();
+        rows[0].attrs[0] = Value::Text("Smyth".into());
+        ds.features = rows.into();
+        let published = shapefile(&ds, &path, &sync).unwrap();
+        assert!(published.notes.is_empty(), "{:?}", published.notes);
+        let (back, _) = crate::io::read_path(&path).unwrap();
+        assert_eq!(back.features.iter().next().unwrap().attrs[0], Value::Text("Smyth".into()));
     }
 
     /// A projected file's unedited shapes stay where they were, to the tolerance.
@@ -1654,9 +1738,12 @@ mod tests {
     }
 
     /// A publish whose read-back has projection round-off says so through `shapefile()`, on any
-    /// platform. Whether a given move's round trip is exact is up to the libm, so several are
-    /// tried in each system: each gives the note exactly when its read-back differs, and at least
-    /// one must, or the noted publish went untested.
+    /// platform: a layer held in longitude/latitude (as a project saved by an older release keeps
+    /// its copy), whose moves are converted into the file's system. Whether a given move's round
+    /// trip is exact is up to the libm, so several are tried in each system: each gives the note
+    /// exactly when its read-back differs, and at least one must, or the noted publish went
+    /// untested. A layer held in the file's system, as one read now is, writes its coordinates as
+    /// they are.
     #[test]
     fn a_publish_with_projection_round_off_says_so() {
         let dir = tempfile::tempdir().unwrap();
@@ -1668,7 +1755,9 @@ mod tests {
                 let mut ds = parcels();
                 ds.crs = Some(crs);
                 crate::io::write_path_in(&ds, &path, crs).unwrap();
-                let (mut ds, sync) = read(&path);
+                let (native, sync) = read(&path);
+                assert_eq!(native.held_in, crs, "{code}: read in the file's own system");
+                let mut ds = native.in_lonlat().unwrap().into_owned();
                 let mut rows: Vec<_> = ds.features.iter().cloned().collect();
                 if let Some(Geometry::Polygon(polys)) = &mut rows[1].geometry {
                     polys[0][0][1].y += dy;
@@ -1676,7 +1765,7 @@ mod tests {
                 ds.features = rows.into();
                 let published = shapefile(&ds, &path, &sync).unwrap();
                 let (back, _) = read(&path);
-                let off = differing(&ds, &back);
+                let off = differing(&ds, &back.in_lonlat().unwrap());
                 assert!(off.is_empty() || off == [2], "{code} {dy}: unedited shapes changed: {off:?}");
                 assert_eq!(published.notes.len(), usize::from(!off.is_empty()), "{code} {dy}: {:?}", published.notes);
                 if let Some(note) = published.notes.first() {

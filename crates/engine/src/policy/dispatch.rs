@@ -123,15 +123,22 @@ impl Session {
         }
         let CallKind::Command { id, params } = &call.kind else {
             return Err(
-                "only standalone archive, column-statistics, shape-conversion or size-by-field commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid or size-by-field commands can prepare a scoped read".into()
             );
         };
         if !matches!(
             id.as_str(),
-            "map.reloadTiles" | "map.repairTiles" | "table.statistics" | "edit.previewShapeConversion" | "layer.sizeBy"
+            "map.reloadTiles"
+                | "map.repairTiles"
+                | "table.statistics"
+                | "data.similar"
+                | "topology.validate"
+                | "edit.previewShapeConversion"
+                | "raster.imageGrid"
+                | "layer.sizeBy"
         ) {
             return Err(
-                "only standalone archive, column-statistics, shape-conversion or size-by-field commands can prepare a scoped read".into()
+                "only standalone archive, column-statistics, similarity, topology, shape-conversion, image-grid or size-by-field commands can prepare a scoped read".into()
             );
         }
         let capture = |s: &mut Session| s.capture_read(id, params);
@@ -147,27 +154,8 @@ impl Session {
     }
     /// Private pre-handler capture shared by native reads and the exact scoped archive entry.
     fn capture_read(&mut self, command: &str, params: &Value) -> Result<crate::cmd::reads::ReadAhead, String> {
-        if !matches!(
-            command,
-            "layer.addData"
-                | "layer.loadAll"
-                | "layer.reloadData"
-                | "layer.repairSource"
-                | "labels.convert"
-                | "model.run"
-                | "script.run"
-                | "map.reloadTiles"
-                | "map.repairTiles"
-                | "topology.validate"
-                | "service.layers"
-                | "service.add"
-                | "source.syncState"
-                | "table.statistics"
-                | "edit.previewShapeConversion"
-                | "layer.sizeBy"
-        ) && crate::cmd::edit::table_edit_in_background(command).is_none()
-        {
-            return Err("only Add Data, Load All, Repair/Reload Data, Convert To Annotation, models, scripts, tile archives, service reads, topology, Source File State, Column Statistics and Size by Field prepare background work".into());
+        if crate::cmd::reads::in_background(command).is_none() {
+            return Err(crate::cmd::reads::not_in_background(command));
         }
         let mut params = params.as_object().cloned().ok_or("read parameters must be an object")?;
         // Scoped previews retain the raw invocation that was approved. Their admitted owner
@@ -180,9 +168,12 @@ impl Session {
                 | "labels.convert"
                 | "source.syncState"
                 | "table.statistics"
+                | "data.similar"
+                | "raster.imageGrid"
                 | "edit.previewShapeConversion"
                 | "layer.sizeBy"
-        ) && (command != "edit.previewShapeConversion" || self.policy_user())
+                | "style.importQgis"
+        ) && (!matches!(command, "edit.previewShapeConversion" | "raster.imageGrid") || self.policy_user())
             || (command == "edit.convertField" && params.get("table").is_none_or(Value::is_null))
         {
             let id = self.layer_id(&Value::Object(params.clone()))?;
@@ -211,7 +202,10 @@ impl Session {
     }
     /// Lands only the original read invocation; no result can be claimed by another command.
     pub(crate) fn finish_read(&mut self, read: crate::cmd::reads::Read) -> CmdResult {
-        let crate::cmd::reads::Read { op, owner, source, ready, inputs } = read;
+        let crate::cmd::reads::Read { op, owner, source, ready, inputs, room, reservation } = read;
+        // History set aside for the edit's copy goes back if the edit fails or never copied, while
+        // nothing else has changed the history since (#2431).
+        let in_place = room.as_ref().is_some_and(|room| room.stamp == self.history_stamp());
         let (command, params) = match op.op() {
             CommandOp::Registered { spec, params } => (spec.id, params.clone()),
             _ => return Err("not a registered read command".into()),
@@ -233,7 +227,11 @@ impl Session {
                         }
                         s.check_read_command(&op)?;
                         s.read_ahead = ready;
-                        let result = s.invoke(op, Txn::Own);
+                        // An edit without a worker copies here, when it lands.
+                        let result = match room.as_ref().filter(|room| room.count > 0) {
+                            Some(room) => rustgis_data::before_rows_copy(room.free_on_copy(), || s.invoke(op, Txn::Own)).0,
+                            None => s.invoke(op, Txn::Own),
+                        };
                         if result.is_ok()
                             && let Some(source) = crate::sources::added_by(command, &params)
                         {
@@ -245,6 +243,12 @@ impl Session {
             })
         }));
         self.read_ahead = None;
+        if let Some(room) = &room {
+            let failed = !matches!(&result, Ok(Ok(_)));
+            self.put_back(room, failed, in_place);
+            self.forget_room(room);
+        }
+        drop(reservation);
         match result {
             Ok(result) => result,
             Err(panic) => std::panic::resume_unwind(panic),
@@ -331,6 +335,19 @@ impl Session {
     /// Only the native user scope may record executable-content provenance.
     pub(crate) fn policy_user(&self) -> bool {
         self.policy.scopes.last().is_none_or(|s| matches!(s.kind, Kind::User))
+    }
+    /// Whether a plugin's authority is in the active scope: one of its commands, or what its
+    /// session program asks between them, through any item it runs.
+    pub(crate) fn policy_plugin(&self) -> bool {
+        /// Looks through item narrowing for a plugin.
+        fn plugin(kind: &Kind) -> bool {
+            match kind {
+                Kind::Plugin { .. } => true,
+                Kind::Item { within, .. } => plugin(within),
+                _ => false,
+            }
+        }
+        self.policy.scopes.last().is_some_and(|s| plugin(&s.kind))
     }
     /// Whether the active scope may exercise reserved connection/account authority.
     pub(crate) fn policy_allows_reserved(&self) -> bool {
@@ -513,11 +530,18 @@ impl Session {
                 }
                 let node = self.admit(node)?;
                 // Its lines run nested: what they couldn't read as true or false is said here (#1600).
-                self.with_unread_bools(Some("script.run"), |s| {
+                let result = self.with_unread_bools(Some("script.run"), |s| {
                     s.with_node(node, |s| {
                         s.guarded("Run Script", true, |s| crate::cmd::workflows::run_script(s, &json!({"script":script})))
                     })
-                })
+                });
+                // Not a command, so no `command_epilogue`: its lines' declaration check is raised here.
+                #[cfg(any(test, feature = "declaration-check"))]
+                if self.depth == 0 {
+                    let broken = self.declaration_broken.take();
+                    assert!(broken.is_none(), "{}", broken.unwrap_or_default());
+                }
+                result
             }
             CallKind::Adapter { .. } => {
                 let node = self.call_node(&self.scope(), call)?;
@@ -687,6 +711,10 @@ impl Session {
         } else if decision != Decision::Allow {
             return Err("this operation needs your approval".into());
         }
+        // Plugins reach only the internet: so does every command one runs that connects.
+        if node.effects.contains(super::Effect::Network) {
+            self.hold_plugin_addresses(&node.params)?;
+        }
         Ok(Arc::new(node))
     }
     /// Keeps the admitted node and synchronous request predicate through nested execution; restores both on panic.
@@ -701,7 +729,13 @@ impl Session {
         }
         let still = continuation.map(|c| Arc::new(move || c.check().is_ok()) as crate::render::rustgis_tiles::cache::Still);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::render::rustgis_tiles::cache::with_optional_still(still, || f(self))
+            // Plugins reach only the internet: so does every request a command one runs makes,
+            // the ones it derives from an address it was given (a listing, a search, a next page)
+            // and the ones a saved connection sends.
+            let held = node.effects.contains(super::Effect::Network) && self.plugin_held();
+            crate::render::rustgis_tiles::cache::with_optional_still(still, || {
+                crate::render::rustgis_tiles::cache::held_to_public(held, || f(self))
+            })
         }));
         let complete =
             if let Some(cursor) = &mut self.policy.cursor { cursor.frames.pop().is_none_or(|(n, at)| n.len() == at) } else { true };
@@ -832,7 +866,7 @@ impl Session {
         op: Authorized<ToolOp>,
         control: &Arc<rustgis_analysis::control::Control>,
         opts: &crate::cmd::gp::RunOpts,
-    ) -> Result<(Value, Vec<String>), String> {
+    ) -> Result<(Value, crate::cmd::gp::ToolMessages), String> {
         let node = op.node.clone();
         let number = node.number;
         let result = self.with_node(node, |s| crate::cmd::gp::execute(s, op, control, opts));
@@ -911,9 +945,24 @@ impl Session {
     }
     /// The sole Handler call seam; preserves transaction ownership and provenance rollback.
     pub(crate) fn invoke(&mut self, op: Authorized<CommandOp>, txn: Txn) -> CmdResult {
+        let result = self.invoke_unfloored(op, txn);
+        // Whatever the command replaced, new features stay above the ids field packages hold: here,
+        // where every command runs (a script's or a task's lines too), so the next one allocates
+        // above them.
+        self.keep_field_floors();
+        result
+    }
+    /// [`Self::invoke`], before field packages' id floors are kept.
+    fn invoke_unfloored(&mut self, op: Authorized<CommandOp>, txn: Txn) -> CmdResult {
         let node = op.node.clone();
         match &op.op {
             CommandOp::Plugin { pin, .. } => {
+                // A plugin's command is a transaction of its own, never a step of another
+                // command: scripts and tasks run registered commands only, and a plugin can't run
+                // another's.
+                if !matches!(txn, Txn::Own) {
+                    return Err("a plugin's command runs only by itself, not as a step of another command".into());
+                }
                 let pin = pin.clone();
                 // Plugin host calls are checked against the pinned manifest, not an invented
                 // finite list of calls made by code that has yet to run.
@@ -932,6 +981,13 @@ impl Session {
                 if let Some(error) = self.url_completion_refusal(spec.id, &params)? {
                     return Err(error);
                 }
+                // The outer replay's mutation is part of its original admission, just like
+                // the inner commands. Read this metadata before the handler consumes it.
+                #[cfg(not(target_arch = "wasm32"))]
+                let selection_epoch = crate::cmd::reads::peek::<crate::cmd::gp::RanAheads>(self, spec.id)
+                    .and_then(|ran| ran.selection_admission.as_ref().map(|a| a.0));
+                #[cfg(target_arch = "wasm32")]
+                let selection_epoch = None;
                 let run = |s: &mut Session| {
                     s.with_node(node, |s| {
                         let editor = s.trust_editor(spec.id, &params);
@@ -958,12 +1014,46 @@ impl Session {
                         result
                     })
                 };
+                // Each step that adds data, however it lands (a read ahead, a download, a URL
+                // read in place, a line of a script or task), may add the layer the project takes
+                // its system from, and any step that changes the project may find a raster added
+                // earlier whose pixels have landed: taken then, so the steps after it (a new map)
+                // start in it, and inside the transaction that made it, so Undo and a failure take
+                // it back and the project is unsaved ([`crate::cmd::project::first_layer_watch`]).
+                let first_layer = crate::cmd::project::first_layer_watch(self, &spec);
+                // A command that doesn't mutate leaves the layers alone, unless it says it moves the
+                // history (Undo, Redo) or replaces the project: what it did on the way (a nested
+                // edit, an unsaved mark, a failure) doesn't excuse it, since by itself nothing
+                // undoes it. Checked on every registered command the unit and integration tests
+                // run, by itself or as a step, so one declared wrong fails them on the paths they
+                // reach (AGENTS.md).
+                #[cfg(any(test, feature = "declaration-check"))]
+                let declared = (!spec.mutates
+                    && !spec.effects.contains(crate::policy::Effect::History)
+                    && !spec.effects.contains(crate::policy::Effect::Replaces))
+                .then(|| self.restored().layers);
                 let result = match txn {
                     Txn::Own => self.guarded(spec.label, spec.mutates, run),
-                    Txn::Shared if spec.id == "edit.applyShapeConversion" => self.savepoint(spec.label, run),
-                    Txn::Shared => run(self),
+                    Txn::Shared => self.shared_step(&spec, run),
                 };
+                if let (Ok(_), Some(before)) = (&result, first_layer) {
+                    crate::cmd::project::take_first_layer_system(self, &before);
+                }
+                #[cfg(any(test, feature = "declaration-check"))]
+                if let Some(before) = declared
+                    && self.restored().layers != before
+                {
+                    self.declaration_broken.get_or_insert_with(|| format!("{} doesn't mutate but changed the layers", spec.id));
+                }
                 self.url_completion_landed(spec.id, &params, &result);
+                if result.is_ok() && (spec.mutates || spec.effects.contains(crate::policy::Effect::History)) && spec.id != "data.similar" {
+                    // Edits and history moves can replace selections without select::set. History
+                    // commands are non-mutating to avoid an extra Undo snapshot, but still express
+                    // later selection intent. Pending reads must preserve it, on any layer.
+                    // Similar's own result is derived output, not a new external selection intent.
+                    let epoch = selection_epoch.unwrap_or_else(|| self.selection_epoch());
+                    self.selection_intent = self.selection_intent.max(epoch);
+                }
                 result
             }
         }

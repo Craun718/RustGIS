@@ -6,7 +6,7 @@
 
 use std::{borrow::Cow, path::Path};
 
-use crate::io::{CsvWriter, GeoJsonWriter, GpkgTable, GpkgWritten, PROJECTED_FORMATS, check_projected, project_each, write_atomic_with};
+use crate::io::{CsvWriter, GeoJsonWriter, GpkgTable, GpkgWritten, check_projected, project_each_leaving_out, write_atomic_with};
 use crate::raster::Crs;
 use crate::rows::Query;
 use crate::source::FeatureSource;
@@ -44,8 +44,13 @@ pub struct Exported {
     /// Vertices beyond 85.05° north or south, written at 85.05° by an export in Web Mercator,
     /// where it ends (0 in another system). See [`crate::web_mercator_moved_note`].
     pub beyond_web_mercator: usize,
+    /// Features with a place the export's system can't hold, written without their geometry
+    /// ([`crate::io::unplaced_export_note`]).
+    pub unplaced: usize,
     /// Geometry and text changed by CSV export, counted over all chunks.
     pub csv: crate::io::CsvLosses,
+    /// Text a CSV changes when read back, counted over all chunks (none for the other formats).
+    pub text: crate::io::TextLosses,
     /// Per field of the layer, values of the source's date fields that weren't dates, so are
     /// written as null ([`crate::source::Batch::unread_dates`], said by
     /// [`crate::source::unread_dates_note`]).
@@ -56,6 +61,11 @@ pub struct Exported {
     /// Per field of the layer, text values `<Null>` the source read as null
     /// ([`crate::source::Batch::null_text`], said by [`crate::source::null_text_note`]).
     pub null_text: Vec<usize>,
+    /// Per field of the layer, text values that aren't valid in the encoding the source read them in
+    /// ([`crate::source::Batch::not_utf8`], said by [`crate::source::not_utf8_note`]).
+    pub not_utf8: Vec<usize>,
+    /// The encoding `not_utf8` is of ([`crate::source::FeatureSource::text_encoding`]).
+    pub not_utf8_in: &'static str,
     /// Per field of the layer, date-times a GeoPackage holds in UTC rather than at their own
     /// offset ([`crate::io::offset_dates`]; empty for the other formats).
     pub utc_dates: Vec<usize>,
@@ -69,7 +79,7 @@ pub struct Exported {
     pub date_messages: Vec<String>,
     /// What reading the source lost or assumed besides the counts above
     /// ([`crate::source::Batch::notes`]), said as they are.
-    pub read_notes: Vec<String>,
+    pub read_notes: crate::loss::Notes,
 }
 
 /// The rows a definition query excluded, or why the stored query could not be applied.
@@ -98,18 +108,8 @@ pub fn write_source_in(src: &dyn FeatureSource, layer: &Dataset, path: &Path, cr
 }
 
 /// As [`write_source_in`], a GeoPackage's table placed as `gpkg` says (see
-/// [`crate::io::write_path_to`]): also returns the table written.
-pub fn write_source_to(
-    src: &dyn FeatureSource,
-    layer: &Dataset,
-    path: &Path,
-    crs: Crs,
-    gpkg: &GpkgTable,
-) -> Result<(Exported, Option<GpkgWritten>)> {
-    write_chunks_to(src, layer, path, crs, gpkg, CHUNK_BYTES, None)
-}
-
-/// As [`write_source_to`], applying the layer's query before projecting or serializing each chunk.
+/// [`crate::io::write_path_to`]), applying the layer's query before projecting or serializing each
+/// chunk: also returns the table written.
 pub fn write_source_filtered(
     src: &dyn FeatureSource,
     layer: &Dataset,
@@ -129,7 +129,7 @@ fn write_chunks_in(src: &dyn FeatureSource, layer: &Dataset, path: &Path, crs: C
     write_chunks_to(src, layer, path, crs, &GpkgTable::default(), bytes, None).map(|(e, _)| e)
 }
 
-/// [`write_source_to`], `bytes` of features a chunk.
+/// [`write_source_filtered`], `bytes` of features a chunk.
 fn write_chunks_to(
     src: &dyn FeatureSource,
     layer: &Dataset,
@@ -228,7 +228,7 @@ fn write_chunks_as(
         return Err(DataError::Unsupported("a source that can't be read a chunk at a time".into()));
     }
     if crs != Crs::LonLat {
-        if !PROJECTED_FORMATS.contains(&ext) {
+        if !crate::io::holds_a_system(ext) {
             return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
         }
         check_projected(ext, crs)?;
@@ -239,28 +239,42 @@ fn write_chunks_as(
         GeometryType::None => first_kind(src, 1 << 20)?,
         t => t,
     };
-    let t = if crs == Crs::LonLat { None } else { Some(Crs::LonLat.to(crs).map_err(DataError::Format)?) };
+    // From the system the source gives its features in.
+    let held = src.coord_crs();
+    let t = if crs == held { None } else { Some(held.to(crs).map_err(DataError::Format)?) };
+    // The longitude/latitude of a place, for the count of those Web Mercator can't hold.
+    let to_lonlat = if held == Crs::LonLat { None } else { Some(held.to(Crs::LonLat).map_err(DataError::Format)?) };
     let mut total = 0usize;
     let mut filtered = 0usize;
     let mut skipped = 0usize;
     let mut beyond_web_mercator = 0usize;
+    let mut unplaced = 0usize;
     let mut null_numbers = 0usize;
     let mut csv = crate::io::CsvLosses::default();
+    let mut text = crate::io::TextLosses::default();
     let mut unread_dates = Vec::new();
     let mut rounded_dates = Vec::new();
     let mut null_text = Vec::new();
-    let mut read_notes = Vec::new();
+    let mut read_notes = crate::loss::Notes::new();
+    let mut not_utf8 = Vec::new();
     let mut utc_dates = Vec::new();
     let mut fine_dates = Vec::new();
     let mut written_values = Vec::new();
-    let mut scratch = query.map(|expr| (expr, Cow::<Dataset>::Owned(layer.clone())));
+    // Measured ($area, $length) in the system the source gives its features in.
+    let mut scratch = query.map(|expr| {
+        let mut input = layer.clone();
+        input.held_in = held;
+        (expr, Cow::<Dataset>::Owned(input))
+    });
     let mut feed = |add: &mut dyn FnMut(&[Feature]) -> Result<()>| -> Result<()> {
         // A GeoPackage export that starts again feeds the features again, and counts them again.
         total = 0;
         filtered = 0;
         beyond_web_mercator = 0;
+        unplaced = 0;
         null_numbers = 0;
         csv = crate::io::CsvLosses::default();
+        text = crate::io::TextLosses::default();
         utc_dates.clear();
         fine_dates.clear();
         written_values.clear();
@@ -277,17 +291,25 @@ fn write_chunks_as(
             // leave out only features without geometry.
             if crs == Crs::WebMercator {
                 for g in chunk.iter().filter_map(|f| f.geometry.as_ref()) {
-                    g.for_each_coord(|c| beyond_web_mercator += usize::from(c.x.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT));
+                    g.for_each_coord(|c| {
+                        let c = match &to_lonlat {
+                            Some(t) => t.point(c).unwrap_or(rustgis_geom::Coord::new(f64::NAN, f64::NAN)),
+                            None => c,
+                        };
+                        beyond_web_mercator += usize::from(c.x.is_finite() && c.y.abs() > rustgis_geom::MAX_LAT)
+                    });
                 }
             }
             if let Some(t) = &t {
-                // Counted by the source scan, so only stopped on a cancel here.
-                project_each(&mut chunk, t, false)?;
+                // Counted by the source scan, so only stopped on a cancel here. A feature with a
+                // place the export's system can't hold is written without its geometry, and said.
+                unplaced = unplaced.saturating_add(project_each_leaving_out(&mut chunk, t, false)?);
             }
             total = total.saturating_add(chunk.len());
             null_numbers = null_numbers.saturating_add(numbers_written_as_null(&chunk, &layer.fields, ext));
             if ext == "csv" {
                 csv += crate::io::CsvLosses::of(&chunk, geometry_type, &layer.fields)?;
+                text += crate::io::TextLosses::of(&chunk, &layer.fields, geometry_type, ext, None);
             }
             if ext == "gpkg" {
                 crate::source::add_unread_dates(&mut utc_dates, &crate::io::offset_dates(chunk.iter(), &layer.fields));
@@ -303,6 +325,7 @@ fn write_chunks_as(
         rounded_dates = batch.rounded_dates;
         null_text = batch.null_text;
         read_notes = batch.notes;
+        not_utf8 = batch.not_utf8;
         Ok(())
     };
     let mut table = None;
@@ -327,7 +350,7 @@ fn write_chunks_as(
             Ok::<_, DataError>(0)
         })?,
         "csv" => write_atomic_with(path, |out| {
-            let mut w = CsvWriter::new(out, &layer.fields, geometry_type)?;
+            let mut w = CsvWriter::new(out, &layer.fields, geometry_type, crs)?;
             feed(&mut |features| w.write(features))?;
             w.finish()?;
             Ok::<_, DataError>(0)
@@ -336,7 +359,7 @@ fn write_chunks_as(
             crate::source::fgb::write_features(&layer.name, geometry_type, &layer.fields, crs, out, &mut feed)
         })?,
         _ => write_atomic_with(path, |out| {
-            let (_, counts, messages) = crate::source::parquet::write_features(geometry_type, &layer.fields, out, &mut feed)?;
+            let (_, counts, messages) = crate::source::parquet::write_features(geometry_type, &layer.fields, crs, out, &mut feed)?;
             unfit = counts;
             date_messages = messages;
             Ok::<_, DataError>(0)
@@ -352,10 +375,14 @@ fn write_chunks_as(
             null_numbers,
             unfit,
             beyond_web_mercator,
+            unplaced,
             csv,
+            text,
             unread_dates,
             rounded_dates,
             null_text,
+            not_utf8,
+            not_utf8_in: src.text_encoding(),
             utc_dates,
             fine_dates,
             written_values,

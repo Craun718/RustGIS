@@ -131,52 +131,62 @@ fn fetch_items(root: &str, keys: &[(String, String)]) -> Result<(HashMap<String,
     let next = std::sync::atomic::AtomicUsize::new(0);
     let capture = rustgis_data::diagnostics::Capture::current();
     let still = crate::render::rustgis_tiles::cache::current_still();
-    std::thread::scope(|scope| {
-        for _ in 0..8.min(keys.len().max(1)) {
-            scope.spawn(|| {
-                crate::render::rustgis_tiles::cache::with_optional_still(still.clone(), || {
-                    let _diagnostic_scope = capture.enter();
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((id, k)) = keys.get(i) else { break };
-                        if failure.lock().is_ok_and(|f| f.is_some()) {
+    // Each file is fetched within the store's reach: a store a document read from the internet
+    // named ([`crate::received::hold`]) is held there, and so are its files, whose own addresses
+    // the hold never saw.
+    let store = {
+        use crate::render::rustgis_tiles::cache::ceiling_for;
+        ceiling_for(root).min(ceiling_for(&format!("{root}/")))
+    };
+    let work = || {
+        crate::render::rustgis_tiles::cache::with_optional_still(still.clone(), || {
+            let _diagnostic_scope = capture.enter();
+            loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((id, k)) = keys.get(i) else { break };
+                if failure.lock().is_ok_and(|f| f.is_some()) {
+                    break;
+                }
+                // A missing file is an expected answer here (see `is_absent`), not a failure:
+                // one omission note replaces its 404/403 diagnostics; real failures still say why.
+                let got = crate::render::rustgis_tiles::cache::download_blocking_omitting_at(&format!("{root}/{k}"), &[404, 403], store);
+                match got {
+                    Ok(b) => {
+                        let len = b.len() as u64;
+                        if total.fetch_add(len, std::sync::atomic::Ordering::Relaxed).saturating_add(len) > zarr::MAX_READ {
+                            if let Ok(mut f) = failure.lock() {
+                                f.get_or_insert(crate::sources::message_with_address(
+                                    root,
+                                    &format!("more than {} GB to read: take a smaller part", zarr::MAX_READ >> 30),
+                                ));
+                            }
                             break;
                         }
-                        // A missing file is an expected answer here (see `is_absent`), not a failure:
-                        // one omission note replaces its 404/403 diagnostics; real failures still say why.
-                        let got = crate::render::rustgis_tiles::cache::download_blocking_omitting(&format!("{root}/{k}"), &[404, 403]);
-                        match got {
-                            Ok(b) => {
-                                let len = b.len() as u64;
-                                if total.fetch_add(len, std::sync::atomic::Ordering::Relaxed).saturating_add(len) > zarr::MAX_READ {
-                                    if let Ok(mut f) = failure.lock() {
-                                        f.get_or_insert(crate::sources::message_with_address(
-                                            root,
-                                            &format!("more than {} GB to read: take a smaller part", zarr::MAX_READ >> 30),
-                                        ));
-                                    }
-                                    break;
-                                }
-                                if let Ok(mut o) = out.lock() {
-                                    o.insert(id.clone(), b);
-                                }
-                            }
-                            Err(e) if is_absent(&e) => {
-                                if crate::render::rustgis_tiles::cache::http_status(&e) == Some(403) {
-                                    forbidden.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                            Err(e) => {
-                                if let Ok(mut f) = failure.lock() {
-                                    // Said by the file's address, without a byte range's mark.
-                                    let file = k.split_once('#').map_or(k.as_str(), |(f, _)| f);
-                                    f.get_or_insert(crate::sources::message_with_address(&format!("{root}/{file}"), &e));
-                                }
-                            }
+                        if let Ok(mut o) = out.lock() {
+                            o.insert(id.clone(), b);
                         }
                     }
-                })
-            });
+                    Err(e) if is_absent(&e) => {
+                        if crate::render::rustgis_tiles::cache::http_status(&e) == Some(403) {
+                            forbidden.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        if let Ok(mut f) = failure.lock() {
+                            // Said by the file's address, without a byte range's mark.
+                            let file = k.split_once('#').map_or(k.as_str(), |(f, _)| f);
+                            f.get_or_insert(crate::sources::message_with_address(&format!("{root}/{file}"), &e));
+                        }
+                    }
+                }
+            }
+        })
+    };
+    std::thread::scope(|scope| {
+        let started = (0..8.min(keys.len().max(1))).filter(|_| std::thread::Builder::new().spawn_scoped(scope, work).is_ok()).count();
+        // A thread the system refuses costs speed: with none, the files are fetched here.
+        if started == 0 {
+            work();
         }
     });
     if let Some(e) = failure.into_inner().ok().flatten() {
@@ -186,6 +196,7 @@ fn fetch_items(root: &str, keys: &[(String, String)]) -> Result<(HashMap<String,
     Ok((out, forbidden.into_inner()))
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod transport_tests {
     /// Drive the real chunk-fetch scoped thread and its blocking native sender. The listening
@@ -235,6 +246,21 @@ mod transport_tests {
         assert!(result.unwrap_err().contains("cancelled"));
         assert_eq!(sends, 0);
         assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    /// The files of a store a document read from the internet named are fetched within the
+    /// store's hold, though the hold never saw their own addresses: one on this computer isn't
+    /// asked for.
+    #[test]
+    fn a_held_stores_files_are_held_too() {
+        use crate::render::rustgis_tiles::cache;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = format!("http://{}/held.zarr", listener.local_addr().unwrap());
+        cache::restrict_to_public(&root);
+        let result = super::fetch(&root, &["zarr.json".into()]);
+        assert_eq!(listener.accept().map(|_| ()).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "a file of the store was asked for");
+        assert!(result.is_err(), "{result:?}");
     }
 }
 
@@ -304,7 +330,8 @@ fn read_store(url: &str, variable: &str) -> Result<(zarr::Store, bool), String> 
 /// `raster.zarrInfo`. It reads the store's metadata and coordinates on the UI thread, with no
 /// Cancel, as it did before windows: the Add Data › Zarr dialog reads them off the frame, and none
 /// of the background paths takes a command that answers with what a store holds yet. A `"bbox"`
-/// adds the variable's two map coordinates, read whole: at most `MAX_COORDS` values each (32 MB
+/// adds the variable's two map coordinates, read whole (none for a grid its `spatial:transform`
+/// places): at most `MAX_COORDS` values each (32 MB
 /// as Float64), each file a download of at most 60 s. A store whose root lists no arrays is read
 /// in up to [`MEMBER_ROUNDS`] more rounds of metadata files ([`store_at`]), each at most
 /// `zarr::member_keys`' 163 names (one or two files each), fetched several at a time.
@@ -441,7 +468,8 @@ fn place_window(root: &str, store: &zarr::Store, sel: &mut zarr::Selection, aske
             let coords = store_files(root, &zarr::window_keys(store, &sel.variable).map_err(at)?)?;
             let (w, cut, widened) = zarr::window_of(store, &sel.variable, &coords, bbox).map_err(at)?;
             sel.window = Some(w);
-            let cells = format!("columns {}–{} and rows {}–{}", w.x0, w.x1, w.y0, w.y1);
+            // A window's ends are exclusive; the text gives the last column and row read.
+            let cells = format!("columns {}–{} and rows {}–{}", w.x0, w.x1.saturating_sub(1), w.y0, w.y1.saturating_sub(1));
             let mut said = Vec::new();
             if cut {
                 said.push(format!("the bbox reaches past the grid: only {cells} within it are read"));
@@ -458,7 +486,8 @@ fn place_window(root: &str, store: &zarr::Store, sel: &mut zarr::Selection, aske
 /// as it did before windows: the Add Data › Zarr dialog reads its slices off the frame and hands
 /// them over (`"ran"`), and none of the background paths takes a command that adds a layer from a
 /// store yet. A window bounds the read: `"cells"` reads only the chunks it touches and its part of
-/// the coordinates; `"bbox"` first reads the variable's two map coordinates whole, at most
+/// the coordinates; `"bbox"` first reads the variable's two map coordinates whole (none for a grid
+/// its `spatial:transform` places), at most
 /// `MAX_COORDS` values each (32 MB as Float64), each file a download of at most 60 s.
 pub(crate) fn add(s: &mut Session, p: &Value) -> CmdResult {
     let asked = asked_window(p)?;
@@ -1801,7 +1830,7 @@ impl ReduceRun {
         use std::sync::atomic::Ordering;
         // The first slice's grid (its size, place and coordinate system), all the run keeps of it.
         let mut first: Option<(u32, u32, raster::GeoTransform, Crs)> = None;
-        let mut totals = super::cube::Totals::new(self.stat, 0)?;
+        let mut totals = super::cube::Totals::new(self.stat, 0, 0)?;
         // Steps never written (no chunk at all), read as having no value.
         let mut unwritten = 0usize;
         // What reading the slices said (a shift the store's system doesn't apply, …), once each:
@@ -1839,7 +1868,7 @@ impl ReduceRun {
                     if len > MAX_REDUCE_CELLS {
                         return Err(format!("{len} cells, more than a summary takes ({MAX_REDUCE_CELLS})"));
                     }
-                    totals = super::cube::Totals::new(self.stat, len)?;
+                    totals = super::cube::Totals::new(self.stat, len, 0)?;
                     first = Some((r.width, r.height, r.transform, r.crs));
                 }
                 // One grid for every step: the same size and coordinate system, its place within a
@@ -1885,8 +1914,9 @@ impl ReduceRun {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn reduce_start(s: &Session, p: &Value) -> Result<ReduceRun, String> {
     let stat = Stat::parse(p)?;
-    // A variable of classes is summarised by cube.reduce, which reads its dates in order.
-    if stat.categorical() {
+    // A variable of classes is summarised by cube.reduce, which reads its dates in order; so is a
+    // median, which holds every date's value, and first, which ranks them.
+    if stat.categorical() || matches!(stat, Stat::Median | Stat::First) {
         return Err(format!(
             "zarr.reduce takes mean, min, max, sum, std, count or countAbove: {} is cube.reduce's (give it this layer or store)",
             stat.code()

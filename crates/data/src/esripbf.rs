@@ -13,7 +13,7 @@
 //!   before them, as Esri writes them and as [`crate::filegdb`] reads them. A ring with no area is
 //!   left out, and said.
 //! - The coordinate system is the answer's (`latestWkid`, `wkid`, else its WKT), read as
-//!   [`crate::filegdb`] reads one; geometry is turned to longitude/latitude.
+//!   [`crate::filegdb`] reads one; geometry is held in it when RustGIS converts it.
 //! - Fields: integers, object ids and dates are integers, dates in milliseconds since 1970 (UTC),
 //!   as the same query gives them as GeoJSON; single and double precision numbers are doubles;
 //!   strings, GUIDs, XML, date-only, time-only and offset timestamps are text, as the service
@@ -123,34 +123,45 @@ pub struct Page {
 pub struct Losses {
     /// Features with a geometry, in an answer naming no coordinate system.
     pub no_crs: bool,
+    /// Features with a geometry, in an answer naming one RustGIS can't use, by a code or a WKT
+    /// (read as longitude/latitude, and said in the report).
+    pub unread_code: bool,
     /// Values that don't fit their field's type.
     pub unreadable: usize,
     /// Values, field names or aliases that aren't valid UTF-8.
     pub not_utf8: usize,
     /// Polygon rings without area.
     pub flat_rings: usize,
-    /// Features whose coordinates are outside their coordinate system.
+    /// Features with a place that can't be given in longitude/latitude (coordinates outside their
+    /// coordinate system): kept as the answer gives them, but not drawn.
     pub unprojected: usize,
     /// Features with Z or M values, dropped.
     pub with_zm: usize,
+    /// Places that convert to beyond longitude/latitude (the answer's system may not fit them).
+    pub beyond: usize,
 }
 
 impl Losses {
     /// Adds another page's.
     pub fn add(&mut self, other: &Losses) {
         self.no_crs |= other.no_crs;
+        self.unread_code |= other.unread_code;
         self.unreadable = self.unreadable.saturating_add(other.unreadable);
         self.not_utf8 = self.not_utf8.saturating_add(other.not_utf8);
         self.flat_rings = self.flat_rings.saturating_add(other.flat_rings);
         self.unprojected = self.unprojected.saturating_add(other.unprojected);
         self.with_zm = self.with_zm.saturating_add(other.with_zm);
+        self.beyond = self.beyond.saturating_add(other.beyond);
     }
 
     /// What they say, one message per kind (as [`read`] says them).
-    pub fn messages(&self) -> Vec<String> {
-        let mut out = Vec::new();
+    pub fn messages(&self) -> crate::loss::Notes {
+        let mut out = crate::loss::Notes::new();
         if self.no_crs {
-            out.push("the answer names no coordinate system; coordinates are read as longitude/latitude".into());
+            out.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                "the answer names no coordinate system; coordinates are read as longitude/latitude",
+            ));
         }
         if self.unreadable > 0 {
             out.push(format!("{} values don't fit their field's type and are left empty", self.unreadable));
@@ -166,12 +177,22 @@ impl Losses {
         }
         if self.unprojected > 0 {
             out.push(format!(
-                "{} features have coordinates outside their coordinate system: they are kept without geometry",
+                "{} features have a place that can't be given in longitude/latitude (coordinates outside their coordinate system): they are kept as the answer gives them, but don't draw",
                 self.unprojected
             ));
         }
+        if self.beyond > 0 {
+            let (count, have, they) = if self.beyond == 1 {
+                ("one feature".to_string(), "has", "it")
+            } else {
+                (format!("{} features", self.beyond), "have", "they")
+            };
+            out.push(format!(
+                "{count} {have} coordinates that come out beyond longitude/latitude once converted from the answer's coordinate system: it may not be their coordinate system, and {they} may draw out of place"
+            ));
+        }
         if self.with_zm > 0 {
-            out.push(crate::zm_note(Some(self.with_zm as u64)));
+            out.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(Some(self.with_zm as u64))));
         }
         out
     }
@@ -182,9 +203,9 @@ pub fn read(bytes: &[u8], name: &str) -> Result<(Dataset, ReadReport)> {
     let mut page = read_page(bytes, name)?;
     page.report.messages.extend(page.losses.messages());
     if page.exceeded_transfer_limit {
-        page.report.messages.push(format!(
-            "the service sent {} features only (its record limit); the rest aren't in this answer",
-            page.dataset.features.len()
+        page.report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedOverLimit,
+            format!("the service sent {} features only (its record limit); the rest aren't in this answer", page.dataset.features.len()),
         ));
     }
     Ok((page.dataset, page.report))
@@ -319,14 +340,26 @@ pub fn read_page_within(bytes: &[u8], name: &str, limit: usize) -> Result<Page> 
             || esri_wkt_over_code(code, wkt.as_deref()).is_some()
             || !wkt.as_deref().is_some_and(crate::raster::wkt::parses))
     {
-        report.messages.push("the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD".into());
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::ChangedEncoding,
+            "the coordinate system's WKT isn't valid UTF-8; the bytes that can't be read are replaced with U+FFFD",
+        ));
     }
+    let said_before = report.messages.len();
     let (crs, to_lonlat) = crate::filegdb::esri_crs(code, wkt.as_deref(), &mut report)?;
+    // A WKT that couldn't be read (or converted) is read as longitude/latitude, and said so;
+    // a geographic one gives no system and says nothing.
+    let mut unread_code = crs.is_none()
+        && report
+            .messages
+            .get(said_before..)
+            .is_some_and(|m| m.iter().any(|m| m.ends_with("; coordinates are read as longitude/latitude")));
     if crs.is_none()
         && wkt.is_none()
         && let Some(code) = code
         && crate::filegdb::crs_of_code(code) != Some(crate::raster::Crs::LonLat)
     {
+        unread_code = true;
         report.messages.push(format!("coordinate system {code} can't be used; coordinates are read as longitude/latitude"));
     }
 
@@ -339,7 +372,7 @@ pub fn read_page_within(bytes: &[u8], name: &str, limit: usize) -> Result<Page> 
     let shape = Shape { kind: shape_kind, transform: &transform, has_z, has_m };
     let mut ds = Dataset::new(name, GeometryType::None, fields);
     let width = ds.fields.len();
-    let (mut any_geometry, mut with_zm, mut unprojected) = (false, 0usize, 0usize);
+    let (mut any_geometry, mut with_zm, mut unprojected, mut beyond) = (false, 0usize, 0usize, 0usize);
     for (n, bytes) in features.into_iter().enumerate() {
         let (values, geometry) = feature(bytes, &columns, width, &shape, &mut tally).map_err(|e| match e {
             DataError::Format(m) => invalid(format!("feature {}: {}", n + 1, m.strip_prefix(PREFIX).unwrap_or(&m))),
@@ -347,29 +380,33 @@ pub fn read_page_within(bytes: &[u8], name: &str, limit: usize) -> Result<Page> 
         })?;
         any_geometry |= geometry.is_some();
         with_zm += usize::from(geometry.is_some() && (has_z || has_m));
-        let geometry = match (geometry, &to_lonlat) {
-            (Some(g), Some(t)) => {
-                let g = crate::io::geometry_to_lonlat(&g, t);
-                unprojected += usize::from(g.is_none());
-                g
+        // Kept as the answer holds it, in its own system; counted when it has no place in
+        // longitude/latitude.
+        if let (Some(g), Some(t)) = (&geometry, &to_lonlat) {
+            match crate::io::places_lonlat_extent(g, t) {
+                Some(e) => beyond += usize::from(e.beyond_lonlat()),
+                None => unprojected += 1,
             }
-            (g, _) => g,
-        };
+        }
         ds.push_next(geometry, values);
     }
     if geometry_type.is_some() || any_geometry {
         ds.geometry_type = layer_type;
     }
     ds.crs = crs;
-    // What couldn't be converted can't come back by defining the projection again.
-    ds.crs_incomplete = unprojected > 0;
+    // Held as the answer gives its coordinates, in its own system, when RustGIS converts it.
+    if let Some(c) = crs.filter(|_| to_lonlat.is_some()) {
+        ds.held_in = c;
+    }
     let losses = Losses {
         // Assumed, so said: an answer that names no coordinate system.
         no_crs: any_geometry && code.is_none() && wkt.is_none(),
+        unread_code: any_geometry && unread_code,
         unreadable: tally.unreadable,
         not_utf8: tally.not_utf8,
         flat_rings: tally.flat_rings,
         unprojected,
+        beyond,
         with_zm,
     };
     ds.zm_dropped = with_zm > 0;

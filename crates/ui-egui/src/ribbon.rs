@@ -166,6 +166,24 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
 
 const SCROLL_BUTTON_W: f32 = 18.0;
 
+/// Whether a tab strip's active tab scrolls into view on this frame: for a few frames (a pass that
+/// egui discards drops its scroll request) after `key` changes, the key being what puts the active
+/// tab where it is: which tab it is, the strip's room, and the widths that place it. Then the wheel
+/// and the arrows move the strip freely.
+pub(crate) fn follow_active<K: Clone + Default + PartialEq + Send + Sync + 'static>(ui: &Ui, id: egui::Id, key: K) -> bool {
+    let (shown, scrolls): (K, u8) = ui.data(|d| d.get_temp(id)).unwrap_or_default();
+    let scrolls = if shown == key { scrolls } else { 0 };
+    if scrolls < 3 {
+        ui.data_mut(|d| d.insert_temp(id, (key, scrolls + 1)));
+    }
+    scrolls < 3
+}
+
+/// Scrolls the active tab at `r` into view, clear of the arrow buttons.
+pub(crate) fn scroll_tab_into_view(ui: &Ui, r: Rect) {
+    ui.scroll_to_rect_animation(r.expand2(vec2(SCROLL_BUTTON_W, 0.0)), None, egui::style::ScrollAnimation::none());
+}
+
 /// Arrow buttons at the edges of a horizontal scroll area (the ribbon's groups, the tab strip)
 /// whose content is wider than the window: the scroll bar is hidden (it would cover the group
 /// labels and tabs) and the wheel alone is undiscoverable.
@@ -204,12 +222,22 @@ fn scroll_buttons<R>(ui: &mut Ui, t: &Tokens, scroll: &egui::scroll_area::Scroll
 
 /// A horizontal scroll area (`area`, named `name`) without a scroll bar, with [`scroll_buttons`]
 /// at its edges.
-fn arrow_scroll_area<R>(ui: &mut Ui, t: &Tokens, name: &str, area: egui::ScrollArea, tips: [&str; 2], add: impl FnOnce(&mut Ui) -> R) {
+pub(crate) fn arrow_scroll_area<R>(
+    ui: &mut Ui,
+    t: &Tokens,
+    name: &str,
+    area: egui::ScrollArea,
+    tips: [&str; 2],
+    add: impl FnOnce(&mut Ui) -> R,
+) {
     // egui sets a scroll area's offset only as it is built, so a click moves it on the next frame.
     // It is asked for once, on a frame egui keeps: a discarded one doesn't move the area, and asking
     // on every frame would pin the area there against the wheel.
     let key = ui.make_persistent_id(("arrow_scroll_offset", name));
-    let mut area = area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
+    // Not animated: an animated scroll-to request (even with no animation) waits as a target until
+    // the next pass, so the next request, computed from the tab where it was still drawn, adds its
+    // distance again and the strip runs past the active tab ([`follow_active`] asks on a few frames).
+    let mut area = area.scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).animated(false);
     let pending = ui.data(|d| d.get_temp::<f32>(key));
     if let Some(x) = pending {
         area = area.horizontal_scroll_offset(x);
@@ -226,6 +254,9 @@ fn arrow_scroll_area<R>(ui: &mut Ui, t: &Tokens, name: &str, area: egui::ScrollA
 
 /// The collapse button at the right of the tab strip.
 const COLLAPSE_W: f32 = 24.0;
+
+/// The space between two tabs of the tab strip.
+const TAB_GAP: f32 = 2.0;
 
 /// The active tool indicator at the right of the tab strip, unless the Explore tool is on: its
 /// label and width.
@@ -260,29 +291,26 @@ fn tab_strip(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let tool = tool_indicator(app, ui);
         let tool_w = tool.as_ref().map_or(0.0, |(_, w)| w + ui.spacing().item_spacing.x);
         let room = (ui.available_width() - COLLAPSE_W - 8.0 - tool_w).max(60.0);
-        // Tighter tabs when the window is too narrow for the usual padding.
-        let text: f32 = tabs.iter().map(|(_, c)| text_w(ui, c, semibold(12.5))).sum();
-        let pad = ((room - text) / tabs.len().max(1) as f32).clamp(8.0, 22.0);
-        // The active tab scrolls into view for a few frames (a pass that egui discards drops its
-        // scroll request) after it changes, or the strip's room or tab widths do.
-        let active_id = egui::Id::unique("tab_strip_active");
+        // Each caption measured once, in semibold (the active tab's face) whichever tab is active, so
+        // the tabs don't move as another is chosen; the tabs take those widths. Tighter tabs when the
+        // window is too narrow for the usual padding, with the spacing between tabs left out of the room.
+        let widths: Vec<f32> = tabs.iter().map(|(_, c)| text_w(ui, c, semibold(12.5))).collect();
+        let text: f32 = widths.iter().sum();
+        let gaps = tabs.len().saturating_sub(1) as f32 * TAB_GAP;
+        let pad = ((room - gaps - text) / tabs.len().max(1) as f32).clamp(8.0, 22.0);
         let key = (app.ui.tab.clone(), room.round() as i32, text.round() as i32);
-        let (shown, scrolls): ((String, i32, i32), u8) = ui.data(|d| d.get_temp(active_id)).unwrap_or_default();
-        let scrolls = if shown == key { scrolls } else { 0 };
-        if scrolls < 3 {
-            ui.data_mut(|d| d.insert_temp(active_id, (key, scrolls + 1)));
-        }
+        let follow = follow_active(ui, egui::Id::unique("tab_strip_active"), key);
         let area = egui::ScrollArea::horizontal().id_salt("tab_strip").max_width(room);
         let tips = [tl!("Scroll the tabs left"), tl!("Scroll the tabs right")];
         arrow_scroll_area(ui, t, "tab_strip", area, tips, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
-                for (tab, caption) in &tabs {
+                ui.spacing_mut().item_spacing = vec2(TAB_GAP, 0.0);
+                for ((tab, caption), caption_w) in tabs.iter().zip(&widths) {
                     let tab = tab.as_str();
                     let active = app.ui.tab == tab;
                     let font = if active { semibold(12.5) } else { regular(12.5) };
                     let shown = caption.as_str();
-                    let w = text_w(ui, shown, font.clone()) + pad;
+                    let w = caption_w + pad;
                     let (r, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
                     resp.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, active, shown));
                     let body = Rect::from_min_max(pos2(r.min.x, r.min.y + 3.0), r.max);
@@ -320,8 +348,8 @@ fn tab_strip(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                     // A tab that became active (clicked, or opened by a command) scrolls
                     // into view, clear of the arrow buttons.
-                    if active && scrolls < 3 {
-                        ui.scroll_to_rect_animation(r.expand2(vec2(SCROLL_BUTTON_W, 0.0)), None, egui::style::ScrollAnimation::none());
+                    if active && follow {
+                        scroll_tab_into_view(ui, r);
                     }
                 }
             });
@@ -335,7 +363,13 @@ fn tab_strip(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             }
             let icon = if app.ui.ribbon_minimized { "chevron_down" } else { "up" };
             icons::paint(ui.painter(), cr.shrink(5.0), icon, t.text_dim, t.accent);
-            let tip = if app.ui.ribbon_minimized { tl!("Expand the ribbon (Ctrl+F1)") } else { tl!("Collapse the ribbon (Ctrl+F1)") };
+            let title = if app.ui.ribbon_minimized { tl_raw!("Expand the ribbon") } else { tl_raw!("Collapse the ribbon") };
+            let shortcut = crate::keymap::shortcut_text(ui.ctx(), app, "ui.ribbon", &Value::Null);
+            let tip = if shortcut.is_empty() {
+                crate::i18n::fmt("{title}", &[("title", title)])
+            } else {
+                crate::i18n::fmt("{title} ({shortcut})", &[("title", title), ("shortcut", &shortcut)])
+            };
             if cresp.on_hover_text(tip).clicked() {
                 let _ = app.run("ui.ribbon", Value::Null);
             }
@@ -522,6 +556,12 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
                             continue;
                         }
                         menu_item(ui, app, "", label, "ui.connection", json!({"kind": kind}));
+                        // An Esri enterprise geodatabase is a SQL Server connection, entered as
+                        // ArcGIS Pro asks for it or from its .sde file.
+                        if kind == "sqlserver" {
+                            let form = json!({"kind": "sqlserver", "form": true});
+                            menu_item(ui, app, "", "Enterprise Geodatabase…", "ui.connection", form);
+                        }
                     }
                 });
                 menu_item(ui, app, "graphics_layer", "Graphics Layer", "graphics.newLayer", Value::Null);
@@ -708,6 +748,27 @@ pub(crate) fn sample_data_gallery(ui: &mut Ui, app: &mut RustGisApp) {
     }
 }
 
+/// The blank basemap's paper colour (#2532), while the map is on it with no web basemap over it:
+/// the colour a map frame shows on a coloured page. The picker is drawn in the gallery itself: a
+/// colour button's picker is a popup of its own, and opening it would close this menu.
+fn blank_paper(ui: &mut Ui, app: &mut RustGisApp) {
+    let map = app.session.map();
+    if map.basemap != Basemap::Blank || !map.tiles.iter().all(|t| t.overlay) {
+        return;
+    }
+    let mut c = crate::theme::c32(map.palette().0);
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(tl!("Paper color")).id_salt("blank_paper").show(ui, |ui| {
+        let picked = ui.scope(|ui| egui::color_picker::color_picker_color32(ui, &mut c, egui::color_picker::Alpha::Opaque));
+        if picked.inner {
+            crate::widgets::one_step_per_press(app, &picked.response);
+            let [r, g, b, _] = c.to_srgba_unmultiplied();
+            let _ =
+                app.run("map.basemap", json!({"name": "blank", "color": rustgis_engine::map::Rgba::rgb(r, g, b).hex(), "keepTiles": true}));
+        }
+    });
+}
+
 pub(crate) fn basemap_gallery(ui: &mut Ui, app: &mut RustGisApp) {
     let t = Tokens::get(ui.ctx());
     ui.label(egui::RichText::new(tl!("Basemaps")).font(semibold(12.5)));
@@ -749,6 +810,7 @@ pub(crate) fn basemap_gallery(ui: &mut Ui, app: &mut RustGisApp) {
             }
         }
     });
+    blank_paper(ui, app);
     web_basemaps(ui, app, &t);
     planet_basemaps(ui, app);
     tile_layers(ui, app, &t);
@@ -1037,6 +1099,28 @@ fn offline_group(app: &mut RustGisApp, ui: &mut Ui) {
                     }
                 });
             }
+            // The versions that lost when an area's edits came back, kept until dismissed (#2468).
+            let held: Vec<(String, usize)> =
+                app.session.project.offline_areas.iter().map(|a| (a.name.clone(), a.conflicts.len())).collect();
+            small_menu(
+                ui,
+                app,
+                "merge",
+                "Conflicts",
+                "Look at the versions that lost when an offline area's edits came back.",
+                move |ui, app| {
+                    if held.is_empty() {
+                        ui.label(egui::RichText::new(tl!("No offline areas")).weak());
+                    }
+                    for (n, count) in &held {
+                        let label = crate::i18n::fmt("{area} ({count})", &[("area", n), ("count", &count.to_string())]);
+                        if ui.button(label).clicked() {
+                            let _ = app.run("ui.dialog", json!({"name": "offlineConflicts", "area": n}));
+                            ui.close();
+                        }
+                    }
+                },
+            );
         });
     });
 }
@@ -1115,6 +1199,12 @@ fn publication_layout(app: &mut RustGisApp, profile: &rustgis_engine::cmd::layou
     if let Some(style) = style {
         p["style"] = json!(style);
     }
+    make_publication(app, p);
+}
+
+/// Runs `layout.publication` with `p`, as the menu and the wizard make a publication layout: its
+/// warnings said and the Publish tab opened; true when the layout was made.
+pub(crate) fn make_publication(app: &mut RustGisApp, p: Value) -> bool {
     // The view's extent may not be known (an empty map): said, and the tab stays.
     match app.run("layout.publication", p) {
         Ok(r) => {
@@ -1124,14 +1214,18 @@ fn publication_layout(app: &mut RustGisApp, profile: &rustgis_engine::cmd::layou
                 app.session.notify(said.join("\n"), false);
             }
             app.ui.tab = "Publish".into();
+            true
         }
-        Err(e) => app.session.notify(e, true),
+        Err(e) => {
+            app.session.notify(e, true);
+            false
+        }
     }
 }
 
 /// A sheet style's name in the menu and what it looks like, `tl!` literals (as
 /// [`publication_label`]); `None` for a style added without them.
-fn publication_style(id: &str) -> Option<(&'static str, &'static str)> {
+pub(crate) fn publication_style(id: &str) -> Option<(&'static str, &'static str)> {
     Some(match id {
         "classic" => (tl!("Classic"), tl!("The title over the map, the sources and the reference in boxes under it.")),
         "banner" => (tl!("Banner"), tl!("The title and subtitle in a band of colour across the top.")),
@@ -1146,7 +1240,7 @@ fn publication_style(id: &str) -> Option<(&'static str, &'static str)> {
 /// A publication figure's name in the menu: a `tl!` literal each, so the catalogs find it (the
 /// engine's labels, which it matches in English); `None` for a figure added without one. Sheets
 /// are named by their page size, as New Layout names it.
-fn publication_label(id: &str) -> Option<&'static str> {
+pub(crate) fn publication_label(id: &str) -> Option<&'static str> {
     Some(match id {
         "figure-1col" => tl!("Journal figure, 1 column (90 mm)"),
         "figure-1.5col" => tl!("Journal figure, 1.5 columns (140 mm)"),
@@ -1163,8 +1257,14 @@ fn publication_sheet(size: &str, orientation: &str) -> Option<&'static rustgis_e
     rustgis_engine::cmd::layout::PUBLICATION_PROFILES.iter().find(|p| p.sheet && p.id == id)
 }
 
+/// A publication profile's name in the menu: its `tl!` literal, or the engine's label for a figure
+/// added without one. The wizard names its sizes with it too.
+pub(crate) fn profile_label(profile: &rustgis_engine::cmd::layout::PublicationProfile) -> &'static str {
+    publication_label(profile.id).unwrap_or_else(|| tl!(profile.label))
+}
+
 /// A page size as the menus name it: `A4 (210 × 297 mm)`, its name translated.
-fn page_label(label: &str, w: f64, h: f64) -> String {
+pub(crate) fn page_label(label: &str, w: f64, h: f64) -> String {
     format!("{} ({w:.0} × {h:.0} mm)", tl!(label))
 }
 
@@ -1209,11 +1309,16 @@ fn project_group(app: &mut RustGisApp, ui: &mut Ui) {
                 }
                 ui.separator();
                 for profile in rustgis_engine::cmd::layout::PUBLICATION_PROFILES.iter().filter(|p| !p.sheet) {
-                    let label = publication_label(profile.id).unwrap_or_else(|| tl!(profile.label));
-                    if ui.button(label).clicked() {
+                    if ui.button(profile_label(profile)).clicked() {
                         publication_layout(app, profile, None);
                         ui.close();
                     }
+                }
+                // The same layout asked step by step: its texts and accent too (#2850).
+                ui.separator();
+                if ui.button(tl!("Publication Layout Wizard…")).clicked() {
+                    let _ = app.run("ui.dialog", json!({"name": "publicationWizard"}));
+                    ui.close();
                 }
             });
             ui.separator();
@@ -1853,8 +1958,8 @@ fn analysis_groups(app: &mut RustGisApp, ui: &mut Ui) {
     });
 }
 
-/// View › Display › Graticule's menu: the graticule's type (choosing one shows it), and the
-/// measured grid's coordinate system.
+/// View › Display › Graticule's menu: the graticule's type (choosing one shows it), whether its
+/// lines go over the layers, their color, and the measured grid's coordinate system.
 fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
     use rustgis_engine::map::graticule::GraticuleType;
     let (on, kind) = (app.session.map().graticule, app.session.map().graticule_type);
@@ -1866,6 +1971,41 @@ fn graticule_menu(ui: &mut Ui, app: &mut RustGisApp) {
             ui.close();
         }
     }
+    ui.separator();
+    // Under the layers, filled ones hide the lines; over them, the lines show on every layer.
+    let mut on_top = app.session.map().graticule_on_top;
+    if ui
+        .checkbox(&mut on_top, tl!("Draw on top of layers"))
+        .on_hover_text(tl!("Draw the grid lines over the map's layers, under the labels; off: under the layers"))
+        .changed()
+        && let Err(e) = app.run("map.graticule", json!({"onTop": on_top}))
+    {
+        app.session.notify(e, true);
+    }
+    let set = app.session.map().graticule_color.is_some();
+    let current = app.session.map().graticule_rgba();
+    ui.horizontal(|ui| {
+        let name = ui.label(tl!("Grid color"));
+        // Named by its label, for a screen reader. The saved color's RGB is kept at no opacity
+        // (`rgba_button`), so raising only the opacity keeps the color.
+        let (resp, picked) = crate::widgets::rgba_button(ui, current);
+        let resp = resp.on_hover_text(tl!("The grid's color and opacity")).labelled_by(name.id);
+        if let Some(picked) = picked {
+            crate::widgets::one_step_per_press(app, &resp);
+            if let Err(e) = app.run("map.graticule", json!({"color": picked.hex8()})) {
+                app.session.notify(e, true);
+            }
+        }
+        if ui
+            .add_enabled(set, egui::Button::new(tl!("Default")))
+            .on_hover_text(tl!("The basemap's grid color"))
+            .on_disabled_hover_text(tl!("The grid already has the basemap's color"))
+            .clicked()
+            && let Err(e) = app.run("map.graticule", json!({"color": null}))
+        {
+            app.session.notify(e, true);
+        }
+    });
     ui.separator();
     let name = ui.label(tl!("Measured grid's coordinate system"));
     ui.vertical(|ui| {
@@ -1932,12 +2072,12 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
             app,
             "graticule",
             "Graticule",
-            "Show or hide the graticule over the basemap: latitudes and longitudes, a measured grid or the UTM zones.",
+            "Show or hide the graticule over the basemap, or over the layers when drawn on top: latitudes and longitudes, a measured grid, the UTM zones or the MGRS grid.",
             "map.graticule",
             Value::Null,
             g,
             "Graticule options",
-            "What the graticule draws: latitudes and longitudes, a measured grid or the UTM zones.",
+            "What the graticule draws: latitudes and longitudes, a measured grid, the UTM zones or the MGRS grid.",
             true,
             graticule_menu,
         );
@@ -2196,6 +2336,18 @@ fn view_tab(app: &mut RustGisApp, ui: &mut Ui) {
         });
     });
     group(ui, "Windows", |ui| {
+        col(ui, |ui| {
+            small(
+                ui,
+                app,
+                "edit",
+                "Annotate",
+                "Show or hide the Annotate pane.",
+                "ui.pane.annotation",
+                Value::Null,
+                app.ui.right == Some(RightPane::Annotation),
+            );
+        });
         big(
             ui,
             app,
@@ -2532,7 +2684,7 @@ fn data_source_group(app: &mut RustGisApp, ui: &mut Ui) {
         );
         #[cfg(not(target_arch = "wasm32"))]
         if active_layer(app).is_some_and(crate::reloaddata::supported) {
-            big(ui, app, "redo", "Reload\nData", crate::reloaddata::HELP, "ui.reloadData", Value::Null, false, false);
+            big(ui, app, "reload", "Reload\nData", crate::reloaddata::HELP, "ui.reloadData", Value::Null, false, false);
         }
     });
 }
@@ -2569,6 +2721,19 @@ fn layer_hint(ui: &mut Ui, text: &str) {
 
 /// The Analyze tab: geoprocessing, workflows and notebooks. Its imagery groups are on the Imagery extension's tab (#1752).
 fn analyze_tab(app: &mut RustGisApp, ui: &mut Ui) {
+    group(ui, "Annotate", |ui| {
+        big(
+            ui,
+            app,
+            "edit",
+            "Annotate",
+            "Choose an image and target layer, then draw in the original image grid.",
+            "ui.pane.annotation",
+            Value::Null,
+            app.ui.right == Some(RightPane::Annotation),
+            false,
+        );
+    });
     analysis_groups(app, ui);
     notebook_group(app, ui);
 }
@@ -2706,7 +2871,7 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
             _ => (Tool::CreatePoint, "point_tool"),
         };
         let checked = app.session.tool.creates();
-        let r = big(
+        let (r, options) = big_split_menu(
             ui,
             app,
             icon,
@@ -2715,8 +2880,14 @@ fn edit_tab(app: &mut RustGisApp, ui: &mut Ui) {
             "tool.set",
             json!({"tool": tool.code()}),
             checked,
-            false,
+            "Create options",
+            "Create a feature by drawing or by coordinates.",
+            true,
+            |ui, app| {
+                menu_item(ui, app, "goto_xy", "Point by Coordinates…", "ui.dialog", json!({"name":"createPointXY"}));
+            },
         );
+        crate::showme::ring(ui, app, options.rect, "ui.dialog", &json!({"name":"createPointXY"}));
         if r.clicked() {
             app.map.cancel_sketch();
         }
@@ -3545,7 +3716,13 @@ fn plugins_tab(app: &mut RustGisApp, ui: &mut Ui) {
             for c in &m.commands {
                 let icon = if crate::icons::ALL.contains(&c.icon.as_str()) { c.icon.as_str() } else { "plugin" };
                 let id = rustgis_engine::plugins::command_id(&m.id, &c.id);
-                big(ui, app, icon, m.translate(lang, &c.label), m.translate(lang, &c.help), &id, Value::Null, false, false);
+                let (help, kept) = login_help(ui.ctx(), c.login, m.translate(lang, &c.help));
+                let resp = big(ui, app, icon, m.translate(lang, &c.label), &help, &id, Value::Null, false, false);
+                if let Some(kept) = kept {
+                    let t = Tokens::get(ui.ctx());
+                    let behind = crate::widgets::bg_fill(&resp, false, &t).unwrap_or(t.ribbon);
+                    login_key(ui, crate::widgets::big_icon_rect(resp.rect), kept, behind);
+                }
             }
             for t in &m.tools {
                 let id = rustgis_engine::plugins::command_id(&m.id, &t.id);
@@ -3586,27 +3763,43 @@ fn plugin_entry(
 ) {
     use rustgis_engine::plugins::{Entry, Layout, command_id};
     let open = panel_open(app, &m.id);
-    let mut show = |icon: &str, label: &str, help: &str, id: &str, params: Value| {
+    // For the sign-in state: `show` borrows `ui` until its last use.
+    let ctx = ui.ctx().clone();
+    // Draws the entry; returns the rectangle of its icon and the colour behind it. A menu row shows
+    // `help` only with `tip` (a command's sign-in line), as other menu rows show none.
+    let mut show = |icon: &str, label: &str, help: &str, id: &str, params: Value, tip: bool| -> (Rect, egui::Color32) {
         let label = if layout != Some(Layout::Large) && label.contains('\n') {
             std::borrow::Cow::Owned(label.replace('\n', " "))
         } else {
             std::borrow::Cow::Borrowed(label)
         };
         let checked = open && id == "ui.pane.plugin";
+        let t = Tokens::get(ui.ctx());
         match layout {
             Some(Layout::Large) => {
-                big(ui, app, icon, &label, help, id, params, checked, false);
+                let resp = big(ui, app, icon, &label, help, id, params, checked, false);
+                (crate::widgets::big_icon_rect(resp.rect), crate::widgets::bg_fill(&resp, checked, &t).unwrap_or(t.ribbon))
             }
             Some(Layout::Small) => {
-                small(ui, app, icon, &label, help, id, params, checked);
+                let resp = small(ui, app, icon, &label, help, id, params, checked);
+                (crate::widgets::small_icon_rect(resp.rect), crate::widgets::bg_fill(&resp, checked, &t).unwrap_or(t.ribbon))
             }
-            None => menu_item(ui, app, icon, &label, id, params),
+            None => {
+                let resp = crate::widgets::menu_item_response(ui, app, icon, &label, id, params);
+                let resp = if tip { resp.on_hover_text(help) } else { resp };
+                let behind = crate::widgets::row_fill(resp.enabled(), &resp, &t).unwrap_or(ui.visuals().window_fill());
+                (crate::widgets::menu_icon_rect(ui, &resp), behind)
+            }
         }
     };
     match m.entry(entry) {
         Some(Entry::Command(c)) => {
             let icon = if crate::icons::ALL.contains(&c.icon.as_str()) { c.icon.as_str() } else { "plugin" };
-            show(icon, m.translate(lang, &c.label), m.translate(lang, &c.help), &command_id(&m.id, &c.id), Value::Null);
+            let (help, kept) = login_help(&ctx, c.login, m.translate(lang, &c.help));
+            let (ic, behind) = show(icon, m.translate(lang, &c.label), &help, &command_id(&m.id, &c.id), Value::Null, kept.is_some());
+            if let Some(kept) = kept {
+                login_key(ui, ic, kept, behind);
+            }
         }
         Some(Entry::Tool(t)) => {
             let name = m.translate(lang, &t.name);
@@ -3615,14 +3808,81 @@ fn plugin_entry(
             } else {
                 std::borrow::Cow::Borrowed(name)
             };
-            show("toolbox", &label, m.translate(lang, &t.summary), "ui.gp.open", json!({"tool": command_id(&m.id, &t.id)}));
+            show("toolbox", &label, m.translate(lang, &t.summary), "ui.gp.open", json!({"tool": command_id(&m.id, &t.id)}), false);
         }
         Some(Entry::Panel(d)) => {
             let (icon, label, help) = panel_button(m, d, lang);
-            show(icon, &label, &help, "ui.pane.plugin", json!({"id": m.id}));
+            show(icon, &label, &help, "ui.pane.plugin", json!({"id": m.id}), false);
         }
         None => {}
     }
+}
+
+/// A plugin command's `help` with, when it needs the sign-in `login`, a line saying which and
+/// whether it is kept; and whether it is, for its key.
+fn login_help<'a>(
+    ctx: &egui::Context,
+    login: Option<rustgis_engine::plugins::Login>,
+    help: &'a str,
+) -> (std::borrow::Cow<'a, str>, Option<bool>) {
+    let Some(login) = login else { return (std::borrow::Cow::Borrowed(help), None) };
+    let kept = login_kept(ctx, login);
+    let gap = if help.is_empty() { "" } else { "\n\n" };
+    (std::borrow::Cow::Owned(format!("{help}{gap}{}", login_text(login, kept))), Some(kept))
+}
+
+/// Whether the sign-in `login` is kept: an Earthdata token that hasn't expired (one remembered on
+/// this computer is read at launch); a Copernicus Data Space sign-in, or one remembered that a request can still use; an ArcGIS
+/// session that renews itself or hasn't expired. Read from what the app keeps in memory, never
+/// from the system's credential store, and once a frame however many buttons ask.
+fn login_kept(ctx: &egui::Context, login: rustgis_engine::plugins::Login) -> bool {
+    use rustgis_engine::plugins::Login;
+    use rustgis_engine::render::rustgis_tiles::{arcgis_auth, copernicus, earthdata};
+    let id = egui::Id::unique("plugin_login_kept");
+    let pass = ctx.cumulative_pass_nr();
+    let slot = match login {
+        Login::Earthdata => 0,
+        Login::Copernicus => 1,
+        Login::Arcgis => 2,
+    };
+    let mut known = ctx.data(|d| d.get_temp::<(u64, [Option<bool>; 3])>(id)).filter(|(p, _)| *p == pass).map_or([None; 3], |(_, k)| k);
+    if let Some(kept) = known[slot] {
+        return kept;
+    }
+    let kept = match login {
+        // A remembered token is read into the session at launch; remembered with none in the
+        // session means one that expired or was damaged and couldn't be deleted.
+        Login::Earthdata => earthdata::has_token() && !earthdata::token_expired(),
+        Login::Copernicus => copernicus::signed_in().is_some() || copernicus::is_usable_remembered_now() == Some(true),
+        Login::Arcgis => arcgis_auth::kept(),
+    };
+    known[slot] = Some(kept);
+    ctx.data_mut(|d| d.insert_temp(id, (pass, known)));
+    kept
+}
+
+/// The tooltip line of a command that needs the sign-in `login`, `kept` or not.
+fn login_text(login: rustgis_engine::plugins::Login, kept: bool) -> String {
+    use rustgis_engine::plugins::Login;
+    let (what, place) = match login {
+        Login::Earthdata => (tl_raw!("the Earthdata Login token"), tl_raw!("Home › Add › Web Data › NASA Earthaccess")),
+        Login::Copernicus => (tl_raw!("a Copernicus Data Space sign-in"), tl_raw!("Home › Add › Web Data › Copernicus Data Space")),
+        Login::Arcgis => (tl_raw!("an ArcGIS sign-in"), tl_raw!("Home › Add › Add Data › From Service")),
+    };
+    if kept {
+        crate::i18n::fmt("Needs {what}: kept.", &[("what", what)])
+    } else {
+        crate::i18n::fmt("Needs {what}, which isn't given: {place}.", &[("what", what), ("place", place)])
+    }
+}
+
+/// The key over the lower-right corner of a command's icon `ic`: green when its sign-in is kept,
+/// red and struck through when it is missing, on a disc of `behind`, the colour behind the button.
+fn login_key(ui: &Ui, ic: Rect, kept: bool, behind: egui::Color32) {
+    let fill = if kept { egui::Color32::from_rgb(0x1E, 0x9E, 0x4A) } else { egui::Color32::from_rgb(0xD6, 0x33, 0x33) };
+    let side = (ic.width() * 0.5).max(10.0);
+    let r = Rect::from_min_size(ic.max - vec2(side * 0.8, side * 0.8), vec2(side, side));
+    icons::key_badge(ui.painter(), r, fill, egui::Color32::from_gray(40), behind, !kept);
 }
 
 /// Popup entries always use menu rows; nested menus cascade rather than opening another ribbon.
@@ -3796,8 +4056,8 @@ fn settings_tab(app: &mut RustGisApp, ui: &mut Ui) {
     if !cfg!(target_arch = "wasm32") {
         group(ui, "Performance", |ui| threads_menu(app, ui));
     }
-    // Only a shell that keeps recovery copies (the desktop app) has autosave.
-    if app.services.recovery.is_some() {
+    // The interval setting is for desktop recovery. Phones checkpoint completed edits.
+    if app.services.recovery.is_some() && !app.autosave.phone {
         group(ui, "Autosave", |ui| autosave_menu(app, ui));
     }
 }
@@ -4208,8 +4468,11 @@ fn effects_groups(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map
             small_form_menu(ui, app, "filter", &label, "Show different features at different scales.", |ui, app| {
                 let input_label =
                     ui.label(egui::RichText::new(tl!("Below 1:5,000,000 show everything; beyond it only what matches:")).small().weak());
-                ui.add(egui::TextEdit::singleline(&mut app.forms.expression).hint_text("pop_max > 1000000").desired_width(220.0))
-                    .labelled_by(input_label.id);
+                let id = egui::Id::unique("display_filters_where");
+                crate::exprcomplete::expr_edit(ui, id, &mut app.forms.expression, Some(&layer.dataset), |e| {
+                    e.hint_text("pop_max > 1000000").desired_width(220.0)
+                })
+                .labelled_by(input_label.id);
                 if ui.button(tl!("Set Filter")).clicked() {
                     let w = app.forms.expression.trim().to_string();
                     let _ =
@@ -4819,7 +5082,7 @@ fn drawing_group(app: &mut RustGisApp, ui: &mut Ui, layer: &rustgis_engine::map:
                 small(
                     ui,
                     app,
-                    if hidden { "symbology" } else { "no_fill" },
+                    if hidden { "restore_fill" } else { "no_fill" },
                     if hidden { "Restore Fill" } else { "No Fill" },
                     if hidden {
                         "Restore polygon fills hidden by No Fill, keeping their colors and outlines."
@@ -5536,6 +5799,20 @@ mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable;
 
+    /// A plugin command's sign-in line says which sign-in, and where to give it when it's missing
+    /// (#2378).
+    #[test]
+    fn login_tooltip_names_the_sign_in_and_where_to_give_it() {
+        use rustgis_engine::plugins::Login;
+        assert_eq!(login_text(Login::Earthdata, true), "Needs the Earthdata Login token: kept.");
+        assert_eq!(
+            login_text(Login::Earthdata, false),
+            "Needs the Earthdata Login token, which isn't given: Home › Add › Web Data › NASA Earthaccess."
+        );
+        assert!(login_text(Login::Copernicus, false).ends_with("Home › Add › Web Data › Copernicus Data Space."));
+        assert!(login_text(Login::Arcgis, false).ends_with("Home › Add › Add Data › From Service."));
+    }
+
     /// The sample with Cities selected, recording the steps run from here on.
     fn cities() -> RustGisApp {
         let mut app = RustGisApp::with_sample();
@@ -5578,6 +5855,11 @@ mod tests {
         h.get_by_label("UTM Zones").click();
         h.run();
         assert!(h.state().session.map().graticule && h.state().session.map().graticule_type == GraticuleType::Utm);
+        h.get_by_label("Graticule options").click();
+        h.run();
+        h.get_by_label("MGRS").click();
+        h.run();
+        assert!(h.state().session.map().graticule && h.state().session.map().graticule_type == GraticuleType::Mgrs);
         // A system typed as an EPSG code: clicking into the field keeps the menu open.
         h.get_by_label("Graticule options").click();
         h.run();
@@ -5616,6 +5898,69 @@ mod tests {
         h.run();
         assert_eq!(h.state().session.map().graticule_crs.as_deref(), Some("EPSG:32633"));
         assert_eq!(h.state().ui.recent_crs.first().map(String::as_str), Some("EPSG:32633"));
+    }
+
+    /// View › Display › Graticule's menu: "Draw on top of layers" puts the lines over the layers
+    /// and back, without showing or hiding the grid; "Default" is offered only once a color is set,
+    /// and takes the grid back to the basemap's.
+    #[test]
+    fn the_graticule_menu_draws_it_on_top_and_resets_its_color() {
+        use egui_kittest::kittest::NodeT;
+        let mut h = tab_harness(RustGisApp::with_sample(), view_tab);
+        let on = h.state().session.map().graticule;
+        assert!(!h.state().session.map().graticule_on_top);
+        h.get_by_label("Graticule options").click();
+        h.run();
+        assert!(h.get_by_label("Default").accesskit_node().is_disabled(), "no color set yet");
+        // The color button, named by its label.
+        h.get_by_role_and_label(egui::accesskit::Role::ColorWell, "Grid color");
+        h.get_by_label("Draw on top of layers").click();
+        h.run();
+        assert!(h.state().session.map().graticule_on_top);
+        assert_eq!(h.state().session.map().graticule, on);
+        // Still open: unticked again.
+        h.get_by_label("Draw on top of layers").click();
+        h.run();
+        assert!(!h.state().session.map().graticule_on_top);
+        h.state_mut().session.run("map.graticule", &json!({"color": "#FF000080"})).unwrap();
+        h.run();
+        h.get_by_label("Default").click();
+        h.run();
+        assert_eq!(h.state().session.map().graticule_color, None);
+    }
+
+    /// The graticule menu's color picker keeps a saved color's RGB at no opacity: raising only the
+    /// opacity of `#33669900` saves `#33669980`, not black at that opacity. Drives the same
+    /// `rgba_button` the menu calls, fed the color the menu feeds it (`graticule_rgba`), typing the
+    /// opacity into the picker's A number, then saves what it picked through `map.graticule` as the
+    /// menu does. (The picker is driven on its own: kittest closes the menu on the click that opens
+    /// the picker's popup.)
+    #[test]
+    fn the_graticule_color_keeps_its_rgb_when_only_the_opacity_is_raised() {
+        let mut app = RustGisApp::with_sample();
+        app.session.run("map.graticule", &json!({"color": "#33669900"})).unwrap();
+        let current = app.session.map().graticule_rgba();
+        assert_eq!(current.hex8(), "#33669900");
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(600.0, 400.0)).build_ui_state(
+            |ui, picked: &mut Option<rustgis_engine::map::Rgba>| {
+                if let (_, Some(c)) = crate::widgets::rgba_button(ui, current) {
+                    *picked = Some(c);
+                }
+            },
+            None,
+        );
+        h.get_by_role(egui::accesskit::Role::ColorWell).click();
+        h.run();
+        // A transparent picker edits linear values; the picker's numbers are R, G, B, A.
+        h.query_all_by_role(egui::accesskit::Role::SpinButton).nth(3).unwrap().focus();
+        h.run();
+        h.event(egui::Event::Text("0.5".into()));
+        h.run();
+        h.key_press(egui::Key::Enter);
+        h.run();
+        let picked = h.state().expect("the picker gave a color");
+        app.session.run("map.graticule", &json!({"color": picked.hex8()})).unwrap();
+        assert_eq!(app.session.map().graticule_rgba().hex8(), "#33669980");
     }
 
     /// The language list names every language in English while the interface is English, with the
@@ -6556,6 +6901,36 @@ mod tests {
         assert_eq!(h.state().session.project.layouts.len(), before + 3);
         let l = h.state().session.project.layouts.last().unwrap();
         assert!(l.elements.iter().all(|e| e.name != "Panel Box" && e.name != "Title"), "a figure, its title left to the caption");
+    }
+
+    /// New Layout › Publication Layout › Publication Layout Wizard… opens the wizard and closes
+    /// the menu, with nothing made yet (#2850).
+    #[test]
+    fn the_publication_menu_opens_the_wizard() {
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1600.0, 1000.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                ui.horizontal(|ui| project_group(app, ui));
+            },
+            cities(),
+        );
+        h.run();
+        let before = h.state().session.project.layouts.len();
+        h.get_by_label("New Layout").click();
+        h.run();
+        h.get_by_label("Publication Layout").hover();
+        h.run();
+        h.get_by_label("Publication Layout Wizard…").click();
+        h.run();
+        assert_eq!(h.state().dialogs.open, Some("publicationWizard"));
+        assert!(h.state().dialogs.publication.is_some());
+        assert_eq!(h.state().session.project.layouts.len(), before, "nothing made yet");
+        assert!(h.query_by_label("Publication Layout Wizard…").is_none(), "the menu closed");
     }
 
     /// A submenu of short rows (a sheet's styles) opens at least SUBMENU_MIN_W wide, not as a

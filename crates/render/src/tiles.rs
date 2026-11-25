@@ -21,7 +21,7 @@ use crate::{PlacedIcon, PlacedLabel, View};
 const MOSAIC: f64 = 2048.0;
 
 /// What drawing the tile layers found.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TileOutput {
     pub labels: Vec<(PlacedLabel, f64)>,
     pub attribution: Vec<String>,
@@ -54,7 +54,24 @@ pub(crate) fn tile_label(l: rustgis_tiles::Label) -> Option<(PlacedLabel, f64)> 
     // Styles often label in two scripts ("Syria\nسوريا"): only the lines the font can
     // draw are kept, so a name never shows as boxes, and a label left with neither text
     // nor an icon is left out.
-    let lines: Vec<&str> = l.text.lines().map(str::trim).filter(|s| !s.is_empty() && crate::text::covers(s, l.bold)).collect();
+    let lines: Vec<&str> = l
+        .text
+        .lines()
+        .map(str::trim)
+        .filter(|s| {
+            if s.is_empty() {
+                return false;
+            }
+            let covered = crate::text::covers(s, l.bold);
+            if !covered {
+                crate::approximations::missing_label_line();
+                crate::approximations::missing_glyphs(
+                    s.chars().filter(|c| !c.is_whitespace() && !crate::text::covers(&c.to_string(), l.bold)),
+                );
+            }
+            covered
+        })
+        .collect();
     if lines.is_empty() && l.icon.is_none() {
         return None;
     }
@@ -151,6 +168,7 @@ pub fn spec(t: &TileLayer) -> Spec {
         layers: t.layers.clone(),
         style_layers: t.style_layers.clone(),
         hidden_layers: t.hidden_layers.clone(),
+        nearest: t.resampling == rustgis_map::raster::Resampling::Nearest,
     }
 }
 
@@ -164,6 +182,19 @@ pub fn source_layers(t: &TileLayer) -> Option<Vec<String>> {
         _ => return None,
     };
     rustgis_tiles::source::source_layers(kind, &t.url)
+}
+
+/// Whether a tile layer draws pictures (`Some(true)`) rather than vector shapes (`Some(false)`):
+/// raster tiles and a cloud-optimised GeoTIFF do, vector tiles and a style don't, and an archive
+/// is known once its header is read (`None` until then; its error when it can't be).
+pub fn draws_pictures(t: &TileLayer) -> Result<Option<bool>, String> {
+    let archive = |kind| rustgis_tiles::source::archive_holds_vectors(kind, &t.url).map(|v| v.map(|vectors| !vectors));
+    match t.kind {
+        TileKind::Raster | TileKind::Cog => Ok(Some(true)),
+        TileKind::Vector | TileKind::Style => Ok(Some(false)),
+        TileKind::PmTiles => archive(Kind::PmTiles),
+        TileKind::MbTiles => archive(Kind::MbTiles),
+    }
 }
 
 /// Where a MapLibre style layer's root properties place the map; `Ok(None)` while the style is
@@ -265,6 +296,8 @@ fn mesh_tiles(v: &rustgis_tiles::shapes::VectorTiles, centre: [f64; 2]) -> (Vec<
 pub(crate) struct Gpu<'a> {
     pub cmds: &'a mut Vec<DrawCmd>,
     pub dirty: &'a mut bool,
+    /// The pictures flushed so far, as the CPU fallback counts them ([`crate::Runs`]).
+    pub runs: &'a mut crate::Runs,
     /// Vector tile styles may be drawn as meshes ([`DrawCmd::TileMeshes`]).
     pub meshes: bool,
     /// Raster tile layers are left for the GPU map to place for each frame ([`DrawCmd::LiveTiles`]).
@@ -374,7 +407,7 @@ pub(crate) fn draw(
                 && t.opacity >= 0.999
                 && let Some(v) =
                     rustgis_tiles::shapes::vector_tiles(&spec(t), &frame, &fetch, Some(&reach), labels.then_some((pm.width(), pm.height())))
-                && crate::flush_acc(pm, g.cmds, g.dirty).is_some()
+                && crate::flush_acc(pm, g.cmds, g.dirty, g.runs).is_some()
             {
                 let (tiles, waiting) = mesh_tiles(&v, origin);
                 if !tiles.is_empty() {
@@ -394,7 +427,7 @@ pub(crate) fn draw(
                 && north_up
                 && t.blend == Blend::Normal
                 && let Some(p) = rustgis_tiles::place_raster(&s, t.opacity, &frame, &fetch, &reach)
-                && crate::flush_acc(pm, g.cmds, g.dirty).is_some()
+                && crate::flush_acc(pm, g.cmds, g.dirty, g.runs).is_some()
             {
                 let archive_revision = if matches!(s.kind, Kind::PmTiles | Kind::MbTiles) {
                     rustgis_tiles::cache::archive_revision([s.url.as_str()])
@@ -413,7 +446,7 @@ pub(crate) fn draw(
             {
                 // What the accumulator holds goes first, under the tiles; with no room for a new
                 // accumulator the layer is drawn into this one instead.
-                let flushed = p.tiles.is_empty() || crate::flush_acc(pm, g.cmds, g.dirty).is_some();
+                let flushed = p.tiles.is_empty() || crate::flush_acc(pm, g.cmds, g.dirty, g.runs).is_some();
                 if flushed {
                     if !p.tiles.is_empty() {
                         g.cmds.push(DrawCmd::Tiles { origin, tiles: p.tiles.iter().map(|q| quad(q, origin)).collect() });
@@ -492,6 +525,7 @@ fn collect(d: rustgis_tiles::Drawn, t: &TileLayer, out: &mut TileOutput) {
         out.errors.push(format!("{name}: {e}"));
     }
     // The layer's opacity fades its text and icons as it fades the rest of what it draws (#1358).
+    let _layer = crate::approximations::NamedLayer::new(name);
     out.labels.extend(d.labels.into_iter().filter_map(tile_label).map(|(l, p)| (fade(l, t.opacity), p)));
 }
 
@@ -608,6 +642,7 @@ fn quad(p: &rustgis_tiles::Placement, origin: [f64; 2]) -> TileQuad {
             ((p.at.max_y - c.min_y) / h) as f32,
         ],
         opacity: p.opacity,
+        nearest: p.nearest,
     }
 }
 
@@ -725,6 +760,46 @@ fn warp(pm: &mut Pixmap, mosaic: &Pixmap, frame: &Frame, to_lonlat: &dyn Fn(f64,
             }
         }
         above = below;
+    }
+}
+
+#[cfg(test)]
+mod missing_label_tests {
+    /// Collection is shared by CPU, GPU and warped tiles, so scope the actual omission there.
+    #[test]
+    fn tile_label_omissions_name_the_tile_layer_and_restore_the_parent() {
+        let _ = crate::approximations::take();
+        crate::approximations::layer(Some("Parent"));
+        let layer = rustgis_map::TileLayer::new("Place tiles", rustgis_map::TileKind::Vector, "https://tiles.test/{z}/{x}/{y}.pbf");
+        let label = rustgis_tiles::Label {
+            text: "\u{10ffff}".into(),
+            x: 0.0,
+            y: 0.0,
+            size: 12.0,
+            color: [0, 0, 0, 255],
+            halo: None,
+            bold: false,
+            italic: false,
+            letter_spacing: 0.0,
+            max_width: 0.0,
+            justify: 0.0,
+            priority: 0.0,
+            anchor: [0.0, 0.0],
+            offset: [0.0, 0.0],
+            angle: None,
+            icon: None,
+            collide: Default::default(),
+        };
+        let drawn = rustgis_tiles::Drawn { labels: vec![label], ..Default::default() };
+        let mut output = super::TileOutput::default();
+        super::collect(drawn, &layer, &mut output);
+        assert!(output.labels.is_empty());
+        crate::approximations::missing_glyphs(['\u{10fffe}']);
+        crate::approximations::layer(None);
+        let notices = crate::approximations::take();
+        assert!(notices.iter().any(|n| n.starts_with("Place tiles:") && n.contains("U+10FFFF")), "{notices:?}");
+        assert!(notices.iter().any(|n| n.starts_with("Parent:") && n.contains("U+10FFFE")), "{notices:?}");
+        assert_eq!(notices.len(), 2, "{notices:?}");
     }
 }
 
@@ -1884,6 +1959,8 @@ pub(crate) mod tests {
                 extent_of: None,
                 extent_color: INDICATOR_COLOR,
                 extent_width: INDICATOR_WIDTH,
+                border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+                border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
                 bearing: 0.0,
                 pitch: 0.0,
             },

@@ -130,6 +130,55 @@ rustgis-cli run --data dem.tif \
   <figcaption>A map exported by <code>rustgis-cli</code>, with no window open.</figcaption>
 </figure>
 
+### Strict runs
+
+Some notices that say a command lost data carry a loss code, such as `dropped.ring`, that stays
+the same however their wording changes. `run --strict` stops after the first command that reports a
+loss with a code that no `--allow` accepts, and exits with status 3, before the commands after it
+and before `--save`. That command, including a failed one, has already run: a file it wrote, or the
+project `--save` wrote when the save itself reported the loss, is already there. Standard error
+lists each loss by code, with how many notices reported it (each notice says how much it lost)
+and what to do about it. Other failures
+still exit with status 1.
+
+Repeat `--allow` to accept the losses a job expects, by kind (`dropped`, `changed`, `approximated`
+or `assumed`) or by code:
+
+```sh
+rustgis-cli run --strict --allow dropped.ring --data storms.rss \
+  --cmd 'share.exportMap={"path":"storms.png"}'
+```
+
+An `--allow` that names no kind or code is refused with status 2, as is `--allow` without
+`--strict`. A code is never renamed or reused, so a job can match on it.
+
+### Loss codes
+
+| Code | What to do |
+|---|---|
+| `dropped.legend` | Use a service with short HTTP or HTTPS addresses for its legend pictures. |
+| `dropped.ring` | Correct the unreadable polygon ring in the source. |
+| `dropped.extra-attributes` | Add fields for the extra attribute values or remove those values from the input. |
+| `dropped.time` | Write to a date-time field to keep the time of day. |
+| `dropped.value` | Correct the value or use a destination field that can hold it. |
+| `dropped.calculation-result` | Correct the expression or check the input rows named in the notice. |
+| `dropped.zm` | Keep the source file where heights or measures matter: RustGIS keeps x and y only. |
+| `dropped.crs-name` | Keep the source file's coordinate system definition with the export. |
+| `dropped.feature` | Correct those features in the source, or read the source in the way the notice suggests. |
+| `dropped.geometry` | Correct the geometry in the source, or give the coordinate system its coordinates are in. |
+| `dropped.over-limit` | Read less at once, such as by filtering or clipping the source first. |
+| `changed.truncated` | Use a decimal field to keep the fractional part. |
+| `changed.body` | Export in the layer's own coordinate system, which keeps its body. |
+| `changed.encoding` | Put a .cpg file naming the file's own encoding beside it. |
+| `changed.rounded` | Keep the source file where times finer than a microsecond matter. |
+| `changed.position` | Export in a coordinate system that holds the positions, such as WGS 84. |
+| `approximated.datum` | Export in the layer's own coordinate system, or give that system with a known transformation to WGS 84. |
+| `approximated.curve` | Keep the source file where exact curves matter: RustGIS draws curves as straight segments. |
+| `assumed.null-marker` | Write the value another way if the text Null is meant as text, not as an empty value. |
+| `assumed.crs` | Give the coordinate system the coordinates are in ("crs" when adding the data, or Define Projection). |
+
+Not every loss has a code yet: losses still reported without one don't stop a strict run.
+
 ## Asking the AI assistant
 
 `ask` gives the [AI Assistant](user-guide/assistant.md) one request. It loads data like `run`,
@@ -140,6 +189,7 @@ export ANTHROPIC_API_KEY=…            # or OPENAI_API_KEY, GEMINI_API_KEY, OPE
 rustgis-cli ask --sample "Which 5 countries have the largest GDP?"
 rustgis-cli ask --sample "Buffer the cities by 200 km and label them" --save buffered.rgis
 rustgis-cli ask --data parcels.geojson --provider ollama --model qwen3:8b "Summarise the fields"
+rustgis-cli ask --sample --image reference.png "Style the countries like this map"
 rustgis-cli ask --models --provider openai          # the provider's models
 rustgis-cli ask --login                             # sign in with ChatGPT to use your ChatGPT plan
 rustgis-cli ask --sample --provider chatgpt "Zoom to Tokyo"

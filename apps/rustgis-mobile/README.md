@@ -72,9 +72,13 @@ Rust calls Java and never the other way: each frame the app collects what happen
   picker gives a document, not a path. Data and projects then open by path, so a GeoPackage is
   edited in place, in its copy: the original is not changed. Every other picker's file (a picture,
   a plugin, a delimited text file) goes to the dialog that asked, as in the browser.
-- **Saving.** Save, Save As and the exports offer their file through the picker, as the browser
-  offers a download. A project saved this way names its picked data by the copies' paths in the
-  app's storage.
+- **Saving.** Save As and the exports offer their file through the picker, as the browser offers
+  a download. Save writes a project (`.rgis`, `.rgisx`) back to the document it was opened from or
+  last saved as, where the provider lets the app write it: Open Project asks for leave to write,
+  for the session (after a restart, Save asks where). It writes a complete copy to `files/saved/…`
+  first, then writes over the document from its start, cuts it to length and syncs it; the copy
+  goes once that is done. A project saved on the phone names its picked data by the copies' paths
+  in the app's storage.
 - **Copies.** The copies of data and projects in `files/picked` stay (a dialog's file is removed
   once read): a project saved on the phone names its data by them. **Remove Unused Copies**, in
   the More sheet, removes the picks the project in the window names no file of, once the user has
@@ -87,8 +91,9 @@ Rust calls Java and never the other way: each frame the app collects what happen
 A phone starts in the touch interface: the map, a bar of four large buttons under it (Layers, Add
 Data, Capture, More) and sheets that rise over the map. The Layers sheet shows and hides layers,
 zooms to one and makes one the active layer; the More sheet has Full Extent, the project, undo
-and redo, and **Use the Desktop Interface**, which brings back the ribbon and panes until the app
-is started again.
+and redo, and **Use the Desktop Interface**, which brings back the ribbon and panes; **Touch
+Interface**, on the View tab (or Use the Touch Interface in Command Search), returns to the phone's
+interface.
 
 **Capture** adds a feature to one of the map's point, line or polygon layers. A cross marks the
 middle of the map: the map is moved under it, and the sheet's fields are filled in (one for each
@@ -229,7 +234,8 @@ own was used outside the area) is said, as a later package from the same phone r
 | HTTPS trust | The bundled Mozilla roots, not the device's certificates; the session says so once (`rustgis_data::http`) |
 | Folders | Settings, app data and the cache are in the app's internal storage, set once at start-up (`rustgis_data::dirs::set_root`) |
 | GeoLibre tools, GDAL formats, DuckDB | Not available: a phone can't run their programs. `rustgis_data::RUNS_PROGRAMS` is false on Android and iOS, so no program is looked for, and each place they would appear says so: a file read through GDAL or a DuckDB database is refused with the reason (convert it on a computer), the SQL pane says why it can't query, and the Geoprocessing pane shows a card in place of the GeoLibre tools. Add Data's Database… stays: its PostGIS, MySQL and SQL Server connections need no program. The app is built without the engine's `geolibre` feature |
-| Preferences, the keychain, autosave | Not wired up yet |
+| Recovery copies | The first foreground edit submits a recovery copy in app-private storage immediately. Edits within two seconds of a submission are grouped into a copy due at the end of that interval. When the exit hook runs, it submits the latest edit immediately and gives the writer up to two seconds to finish. Suspending or destroying the Android activity can skip this hook, so edits still waiting to be submitted can be lost. The next launch offers the last complete copy, if one exists. |
+| Preferences, the keychain | Not wired up yet |
 | Soft keyboard | It opens for a text field, and the touch interface keeps the field above it. `NativeActivity`'s text input is still poor (no suggestions, no composing): a real app moves to `GameActivity` |
 
 ## What phase 0 found
@@ -245,7 +251,7 @@ On the Android 15 emulator (x86_64, software GPU), from this crate as it is:
 | HTTPS basemap tiles | Yes, with the bundled roots |
 | Rotation | Yes, without a restart |
 | Suspend and resume | Yes: the surface is dropped and made again, the session is kept |
-| The activity destroyed by the system | The session is lost. winit's event loop can't be made twice in a process, so the app ends its process and the next launch starts afresh; without that, the next launch showed nothing |
+| The activity destroyed by the system | The session is lost. winit's event loop can't be made twice in a process, so the app ends its process if the loop returns; destroying the activity alone doesn't make it return, so the process may survive, and a launch in that same process may not start. Once the system ends the process, the next launch starts a new one, and the recovery copies written while editing let it offer a complete copy |
 | Typing | Key events reach text fields. The soft keyboard itself needs a phone to judge |
 | Size | 78 MB for arm64 without symbols, 89 MB in the APK for x86_64 |
 
@@ -391,7 +397,7 @@ cp parcels.gpkg "$(xcrun simctl get_app_container booted org.rustgis.mobile data
 | | On iOS |
 |---|---|
 | Opening | UIKit's document picker, any file, several at once (a Shapefile's parts). It gives the original documents, wherever they are (iCloud Drive, another app's folder): each is read inside its security scope, through a file coordinator (a document in iCloud Drive is downloaded first), and copied into `Library/Application Support/picked/…` off the main thread, a folder for each folder the documents came from, and opened from there as on Android. The original is not changed |
-| Saving | The bytes are written to the app's `tmp` folder under the name offered, off the main thread, and then the document picker exports a copy where the user chooses; then the file in `tmp` is removed. Cancelled, the app says the file wasn't saved |
+| Saving | The bytes are written to the app's `tmp` folder under the name offered, off the main thread, and then the document picker exports a copy where the user chooses (a project is moved there instead, so the app may write it again); then the file in `tmp` is removed. Cancelled, the app says the file wasn't saved. Save writes a project back to the document it was opened from or saved as, kept as a security-scoped bookmark: atomically, inside a coordinated write, off the main thread |
 | Position | Core Location, best accuracy. Asked the first time (`NSLocationWhenInUseUsageDescription`); positions start once the user allows them. Refused, now or later in Settings, the app says so and stops asking |
 | Out of sight | Recording a track turns on background location updates (the app's `location` background mode in `Info.plist`), with iOS's indicator that an app is using the location. Positions found out of sight wait, at most 200,000, as on Android |
 | Camera | `UIImagePickerController`: the photo is written as a JPEG to `Library/Application Support/photos`. A device without a camera (the Simulator) says so |

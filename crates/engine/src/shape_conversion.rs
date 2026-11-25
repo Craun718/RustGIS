@@ -22,6 +22,12 @@ impl Shape {
             Self::RotatedBox(s) => s.geometry(),
         }
     }
+    pub(crate) fn built(&self) -> Result<crate::construction::Built, String> {
+        match self {
+            Self::Circle(s) => s.built(),
+            Self::RotatedBox(s) => s.built(),
+        }
+    }
 }
 /// An ephemeral preview, bound to this source instance, revision and exact geometry. Not a file
 /// format or a recovered construction: callers explicitly apply the proposed replacement.
@@ -211,33 +217,14 @@ fn target(s: &Session, p: &Value) -> Result<Proposal, String> {
         shape: Shape::Circle(CircleSpec { frame: Frame::default(), center: [0., 0.], radius: 1., tolerance: 0.25 }),
     })
 }
-fn frame(raster: Option<&rustgis_map::raster::RasterLayer>, p: &Value) -> Result<Frame, String> {
+fn frame(raster: Option<&rustgis_map::raster::RasterLayer>, p: &Value, crs: rustgis_data::raster::Crs) -> Result<Frame, String> {
     if let Some(r) = raster {
-        let grid = if let Some(bytes) = &r.embedded {
-            rustgis_data::raster::geotiff::read_image_grid(std::io::Cursor::new(bytes.as_slice()))
-        } else {
-            let path = r
-                .path
-                .as_deref()
-                .filter(|p| rustgis_map::paths::is_local(p))
-                .ok_or("choose a local or embedded GeoTIFF; remote original grids are not read by conversion")?;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let input = std::fs::File::open(path).map_err(|e| e.to_string())?;
-                rustgis_data::raster::geotiff::read_image_grid(input)
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = path;
-                return Err("upload the original GeoTIFF to use its grid in the browser".into());
-            }
-        }
-        .map_err(|e| e.to_string())?;
-        Frame::from_grid(&grid)
+        crate::image_grid::read(r)
     } else if let Some(f) = p.get("frame") {
         serde_json::from_value(f.clone()).map_err(|e| e.to_string())
     } else {
-        Ok(Frame::default())
+        // The layer's own grid when it has one (#2032 C2f-6), else Web Mercator grid metres.
+        Ok(Frame::for_crs(crs))
     }
 }
 struct Prepared {
@@ -249,12 +236,13 @@ fn gather(dataset: &Dataset, mut t: Proposal, raster: Option<&rustgis_map::raste
     if raster.is_some() && p.get("frame").is_some() {
         return Err("choose image or frame, not both".into());
     }
-    let f = frame(raster, p)?;
-    t.shape = fit(
-        dataset.features.get(t.row).and_then(|f| f.geometry.as_ref()).ok_or("missing polygon")?,
-        f,
-        p.get("kind").and_then(Value::as_str).ok_or("kind is required")?,
-    )?;
+    let f = frame(raster, p, dataset.coord_crs())?;
+    // Fitted in longitude/latitude, from the layer's own coordinates, as its shape's geometry is
+    // given (`replace_geometry` writes it back in them).
+    let feature = dataset.features.row(t.row).ok_or("missing polygon")?;
+    let polygon = feature.geometry().ok_or("missing polygon")?;
+    let polygon = dataset.feature_to_lonlat(feature.id(), polygon)?;
+    t.shape = fit(&polygon, f, p.get("kind").and_then(Value::as_str).ok_or("kind is required")?)?;
     Ok(t)
 }
 fn source(s: &Session, p: &Value) -> Result<Option<rustgis_map::raster::RasterLayer>, String> {
@@ -277,7 +265,7 @@ pub(crate) fn preview(s: &mut Session, p: &Value) -> CmdResult {
     let ready = crate::cmd::reads::take::<Prepared>(s, "shapeConversion");
     #[cfg(not(target_arch = "wasm32"))]
     if ready.is_none() && s.statistics_window_thread == Some(std::thread::current().id()) {
-        return Err("shape fitting needs the desktop background preview queue; use Convert to or a direct MCP preview request".into());
+        return Err("shape fitting needs the desktop background preview queue; use Convert Polygon to Shape… (its Preview Conversion), or ask for edit.previewShapeConversion through MCP".into());
     }
     let done = if let Some(a) = ready {
         let l = s.map().layer(t.layer).ok_or("no layer")?;
@@ -305,8 +293,7 @@ pub(crate) fn apply(s: &mut Session, p: &Value) -> CmdResult {
     polygon(l.dataset.features.get(proposal.row).and_then(|f| f.geometry.as_ref()).ok_or("missing polygon")?)?;
     s.constructions.room()?;
     let attributes = l.dataset.features.get(proposal.row).ok_or("no feature")?.attrs.clone();
-    let g = proposal.shape.geometry()?;
-    crate::cmd::design::replace_geometry(s, proposal.layer, proposal.row, g)?;
+    proposal.shape.built()?.replace(s, proposal.layer, proposal.row)?;
     if s.map()
         .layer(proposal.layer)
         .and_then(|l| l.dataset.features.get(proposal.row))
@@ -620,6 +607,131 @@ mod tests {
         assert!((fit.radius - 1.).abs() < 1e-5);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    mod linked_images {
+        use super::*;
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster, geotiff};
+
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn pixels() -> Raster {
+            Raster::new(
+                "image",
+                64,
+                64,
+                vec![vec![1.; 4096]],
+                GeoTransform { origin_x: 100., origin_y: 2000., pixel_width: 2., pixel_height: -3. },
+                Crs::from_epsg(3857).unwrap(),
+                None,
+                ColorHint::Gray,
+                "UInt8",
+            )
+            .unwrap()
+        }
+        fn setup(case: &str, kind: &str, queued: bool) -> (Dir, Session, u32, u32, Frame) {
+            let dir = Dir(std::env::temp_dir().join(format!("rustgis-conversion-linked-{}-{case}-{kind}-{queued}", std::process::id())));
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let path = dir.0.join("image.tif");
+            let bytes = geotiff::write(&pixels(), 0).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let frame = Frame::from_grid(&geotiff::read_image_grid(std::io::Cursor::new(&bytes)).unwrap()).unwrap();
+            let geometry = if kind == "circle" {
+                CircleSpec { frame: frame.clone(), center: [32., 32.], radius: 5., tolerance: 0.01 }.geometry().unwrap()
+            } else {
+                BoxSpec { frame: frame.clone(), center: [32., 32.], width: 12., height: 8., angle: 27. }.geometry().unwrap()
+            };
+            let (mut s, layer) = ordinary(geometry);
+            let image = s.map_mut().add_raster(
+                "Image",
+                rustgis_map::RasterLayer::from_path(rustgis_data::raster::read_path(&path).unwrap(), path.display().to_string()),
+            );
+            (dir, s, layer, image, frame)
+        }
+        fn preview(s: &mut Session, params: &Value, queued: bool) -> Result<Value, String> {
+            if queued {
+                let read = crate::cmd::reads::read_ahead(s, "edit.previewShapeConversion", params)?;
+                let done = read.run(&rustgis_analysis::control::Control::new())?;
+                crate::cmd::reads::read_land(s, done)
+            } else {
+                s.run("edit.previewShapeConversion", params)
+            }
+        }
+        fn apply(s: &mut Session, layer: u32, params: &Value, queued: bool, expected: &Frame) {
+            let before = s.map().layer(layer).unwrap().dataset.features[0].clone();
+            let depth = s.undo_depth();
+            let value = preview(s, params, queued).unwrap();
+            let proposal: Proposal = serde_json::from_value(value.clone()).unwrap();
+            let frame = match proposal.shape {
+                Shape::Circle(c) => c.frame,
+                Shape::RotatedBox(b) => b.frame,
+            };
+            assert_eq!(&frame, expected);
+            assert_eq!(s.undo_depth(), depth);
+            assert_eq!(s.map().layer(layer).unwrap().dataset.features[0], before);
+            s.run("edit.applyShapeConversion", &json!({"preview":value,"confirm":true})).unwrap();
+            assert_eq!(s.undo_depth(), depth + 1);
+            let after = &s.map().layer(layer).unwrap().dataset.features[0];
+            assert_eq!(after.id, before.id);
+            assert_eq!(after.attrs, before.attrs);
+            assert!(s.circle_spec(layer, 0).is_some() || s.box_spec(layer, 0).is_some());
+        }
+
+        #[test]
+        fn shape_conversion_verified_local_images_preview_and_apply_in_both_read_paths() {
+            for queued in [false, true] {
+                for kind in ["circle", "rotatedBox"] {
+                    let (_dir, mut s, layer, image, frame) = setup("verified", kind, queued);
+                    apply(&mut s, layer, &json!({"layer":layer,"row":0,"kind":kind,"image":image}), queued, &frame);
+                }
+            }
+        }
+
+        #[test]
+        fn shape_conversion_local_image_failures_preserve_features_and_recover_after_reload() {
+            for queued in [false, true] {
+                for kind in ["circle", "rotatedBox"] {
+                    for case in ["missing", "unverified", "changed"] {
+                        let (dir, mut s, layer, image, frame) = setup(case, kind, queued);
+                        let raster = s.map_mut().layer_mut(image).unwrap().raster.as_mut().unwrap();
+                        let expected = match case {
+                            "missing" => {
+                                raster.data = None;
+                                "pixels are not loaded"
+                            }
+                            "unverified" => {
+                                raster.data = Some(std::sync::Arc::new(pixels()));
+                                "no verified original file revision"
+                            }
+                            _ => {
+                                let path = dir.0.join("image.tif");
+                                let mut bytes = std::fs::read(&path).unwrap();
+                                bytes.push(0); // Valid TIFF, deterministically different length even on coarse-timestamp filesystems.
+                                std::fs::write(path, bytes).unwrap();
+                                "file changed"
+                            }
+                        };
+                        let before = s.map().layer(layer).unwrap().dataset.features[0].clone();
+                        let depth = s.undo_depth();
+                        let params = json!({"layer":layer,"row":0,"kind":kind,"image":image});
+                        let error = preview(&mut s, &params, queued).unwrap_err();
+                        assert!(error.contains(expected), "{error}");
+                        assert!(error.contains("Reload Data") && error.contains("retry"), "{error}");
+                        assert!(!error.contains("Reload Grid"), "conversion has no Reload Grid action: {error}");
+                        assert_eq!(s.undo_depth(), depth);
+                        assert_eq!(s.map().layer(layer).unwrap().dataset.features[0], before);
+                        assert!(s.box_spec(layer, 0).is_none() && s.circle_spec(layer, 0).is_none());
+                        s.run("layer.reloadData", &json!({"layer":image})).unwrap();
+                        apply(&mut s, layer, &params, queued, &frame);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn shape_conversion_enclosing_fits_are_stable_for_concave_polygons() {
         let frame = Frame::default();
@@ -629,5 +741,37 @@ mod tests {
         assert!((b.width * b.height - 10000.).abs() < 1e-5);
         let Shape::Circle(c) = fit(&g, frame, "circle").unwrap() else { panic!() };
         assert!((c.radius - 50_f64.hypot(50.)).abs() < 1e-5);
+    }
+
+    /// On a layer held in a projected system, a conversion with no frame fits in the layer's own
+    /// grid, and the shape is written there as built: a rectangle stored in UTM comes back as
+    /// that rectangle, its corners where they were.
+    #[test]
+    fn a_conversion_on_a_projected_layer_fits_in_its_own_grid() {
+        use rustgis_data::raster::Crs;
+        use rustgis_geom::Coord;
+        let mut ds = Dataset::new("Lots", GeometryType::Polygon, vec![Field::new("class", FieldType::Text)]);
+        ds.hold_in(Crs::Epsg(32632)).unwrap();
+        let rect = [
+            Coord::new(684_000., 5_397_000.),
+            Coord::new(684_120., 5_397_000.),
+            Coord::new(684_120., 5_397_040.),
+            Coord::new(684_000., 5_397_040.),
+            Coord::new(684_000., 5_397_000.),
+        ];
+        ds.push(Some(Geometry::Polygon(vec![vec![rect.to_vec()]])), vec![rustgis_data::Value::Text("lot".into())]);
+        let mut s = Session::new(crate::Project::default());
+        let id = s.map_mut().add_dataset(ds);
+        s.active_layer = Some(id);
+        s.run("edit.enable", &json!({"on":true})).unwrap();
+        let p = s.run("edit.previewShapeConversion", &json!({"layer":id,"row":0,"kind":"rotatedBox"})).unwrap();
+        s.run("edit.applyShapeConversion", &json!({"preview":p,"confirm":true})).unwrap();
+        let b = s.box_spec(id, 0).unwrap();
+        assert_eq!(b.frame, Frame::for_crs(Crs::Epsg(32632)));
+        let mut got = Vec::new();
+        s.map().layer(id).unwrap().dataset.features[0].geometry.as_ref().unwrap().for_each_coord(|c| got.push(c));
+        for c in &rect {
+            assert!(got.iter().any(|g| (g.x - c.x).abs() < 1e-6 && (g.y - c.y).abs() < 1e-6), "{c:?} in {got:?}");
+        }
     }
 }

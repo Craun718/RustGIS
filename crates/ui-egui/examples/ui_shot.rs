@@ -32,10 +32,15 @@
 //! `"watchFiles": true` on the first line watches linked files for changes, as the desktop app
 //! does; `{"copy": [from, to]}` replaces `to` with a copy of `from` (written beside it, then
 //! renamed over it) and `{"remove": path}` deletes a file, as another program would.
+//! `{"picked": {"name": name, "path": path}}` gives the app the file at `path` as the browser's
+//! or the phone's picker answers, under `name` (which starts with the picker's mark, such as
+//! `ASSISTANT_PICK`).
 //! `"recovery": "/abs/dir"` on the first line gives the run that recovery folder, as the desktop
 //! app has one (Settings › Autosave; a copy left there is offered by the recovery dialog).
 //! `"touch": true` on the first line gives the run a stand-in for a phone's touch interface (the
 //! map alone), kept as a phone's shell keeps it: the View tab then has Touch Interface.
+//! The phone's foreground recovery policy requires both `"recovery"` and `"touch": true`.
+//! A recovery folder without touch uses the desktop interval.
 //! `"gridFolders": true` on the first line reads and keeps datum grids in RustGIS's grid folder, as
 //! the desktop app does (Settings › Datum Grids; set `RUSTGIS_APP_DATA_DIR` for a run's own).
 //! `"memorySecrets": true` on the first line supplies an isolated in-memory credential store for
@@ -175,14 +180,19 @@ fn main() {
     let mut app = RustGisApp::with_sample();
     // As the desktop app does: Add Data, Load All, models and scripts run on a thread of their own.
     app.reads_off_frame = lines.first().and_then(|l| l.get("readsOffFrame")).and_then(Value::as_bool).unwrap_or(false);
-    if lines.first().and_then(|l| l.get("touch")).and_then(Value::as_bool) == Some(true) {
+    let touch = lines.first().and_then(|l| l.get("touch")).and_then(Value::as_bool) == Some(true);
+    if touch {
         app.touch = Some(touch_stand_in);
     }
     // As the desktop app does: linked files changed on disk are reported (#1477).
     app.watch_files = lines.first().and_then(|l| l.get("watchFiles")).and_then(Value::as_bool).unwrap_or(false);
     if let Some(dir) = lines.first().and_then(|l| l.get("recovery")).and_then(Value::as_str) {
         let store = rustgis_ui_egui::FolderStore::open(std::path::Path::new(dir)).expect("recovery folder");
-        app = app.with_services(rustgis_ui_egui::Services { recovery: Some(Box::new(store)), ..Default::default() });
+        app = if touch {
+            app.with_edit_recovery(Box::new(store))
+        } else {
+            app.with_services(rustgis_ui_egui::Services { recovery: Some(Box::new(store)), ..Default::default() })
+        };
     }
     if lines.first().and_then(|l| l.get("memorySecrets")).and_then(Value::as_bool) == Some(true) {
         app.session.database_logins.set_store(Some(std::sync::Arc::new(rustgis_engine::data::secrets::MemorySecrets::new())));
@@ -266,6 +276,15 @@ fn main() {
             let beside = format!("{to}.ui_shot-copy");
             if let Err(e) = std::fs::copy(from, &beside).and_then(|_| std::fs::rename(&beside, to)) {
                 eprintln!("copy {from} → {to}: {e}");
+            }
+        } else if let Some(picked) = l.get("picked") {
+            // A file the browser's or the phone's picker gave, marked as its picker marks it.
+            let (name, path) = (picked["name"].as_str().unwrap_or_default(), picked["path"].as_str().unwrap_or_default());
+            match std::fs::read(path) {
+                Ok(bytes) => {
+                    let _ = harness.state_mut().open_picked(name, &bytes);
+                }
+                Err(e) => eprintln!("picked {path}: {e}"),
             }
         } else if let Some(path) = l.get("remove").and_then(Value::as_str) {
             if let Err(e) = std::fs::remove_file(path) {

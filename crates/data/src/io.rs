@@ -29,19 +29,27 @@ const MEMORY_PER_BYTE: u64 = 8;
 
 /// Largest file read into memory on this computer (#2408): on the desktop as much as a quarter of
 /// its memory holds at [`MEMORY_PER_BYTE`] a byte, from [`BYTES_FLOOR`] up to [`BYTES_CEILING`],
-/// as the other memory limits follow it (#1291 step 2); [`BYTES_FLOOR`] in the browser.
+/// as the other memory limits follow it (#1291 step 2); [`BYTES_FLOOR`] in the browser. Less once
+/// RustGIS holds more than half the memory, or the computer has less free ([`crate::memory::share`],
+/// #2431), never below the floor.
 pub fn max_bytes() -> u64 {
     if let Some(max) = TEST_MAX.with(std::cell::Cell::get) {
         return max;
     }
-    max_bytes_for(crate::memory::physical())
+    max_bytes_within(crate::memory::share(crate::memory::physical(), crate::memory::held(), crate::memory::available()))
 }
 
-/// [`max_bytes`] on a computer with `memory` bytes (`None`: not known). The formula is
-/// [`crate::memory::scaled`]'s, worked out here in `u64`, as that one counts in `usize`, which
-/// doesn't hold 4 GiB on a 32-bit build.
+/// [`max_bytes`] on a computer with `memory` bytes (`None`: not known) with nothing held. The
+/// formula is [`crate::memory::scaled`]'s, worked out here in `u64`, as that one counts in `usize`,
+/// which doesn't hold 4 GiB on a 32-bit build.
 fn max_bytes_for(memory: Option<u64>) -> u64 {
-    memory.map_or(BYTES_FLOOR, |m| (m / crate::memory::SHARE / MEMORY_PER_BYTE).clamp(BYTES_FLOOR, bytes_ceiling()))
+    max_bytes_within(memory.map(|m| m / crate::memory::SHARE))
+}
+
+/// [`max_bytes`] when a job plans for `share` bytes ([`crate::memory::share`]; `None`: not known):
+/// less once RustGIS holds more than half the memory (#2431), never below [`BYTES_FLOOR`].
+fn max_bytes_within(share: Option<u64>) -> u64 {
+    share.map_or(BYTES_FLOOR, |share| (share / MEMORY_PER_BYTE).clamp(BYTES_FLOOR, bytes_ceiling()))
 }
 
 /// The most [`max_bytes`] grows to in this build: [`BYTES_CEILING`] on a 64-bit desktop build. A
@@ -59,15 +67,39 @@ pub fn too_large(len: u64) -> String {
     too_large_said(len, max_bytes())
 }
 
-/// [`too_large`] against the limit `max` taken when the read started.
+/// [`too_large`] against the limit `max` taken when the read started. What is held and free is
+/// read again here: it may have moved since `max` was taken, so the figures said are the ones now,
+/// beside the limit the read was held to.
 fn too_large_said(len: u64, max: u64) -> String {
-    let follows = crate::memory::physical().is_some() && bytes_ceiling() > BYTES_FLOOR;
-    let limit = if follows {
-        format!("{} on this computer, a limit that follows its memory", size_said(max, false))
-    } else {
-        size_said(max, false)
+    let memory = crate::memory::physical().filter(|_| bytes_ceiling() > BYTES_FLOOR);
+    // A test's own limit isn't lowered by what is held or free.
+    let (held, free) =
+        if TEST_MAX.with(std::cell::Cell::get).is_some() { (0, None) } else { (crate::memory::held(), crate::memory::available()) };
+    too_large_held(len, max, memory, held, free)
+}
+
+/// [`too_large_said`] on a computer with `memory` bytes (`None`: the limit doesn't follow it)
+/// while RustGIS holds `held` and `free` is free (`None`: not known): when the limit is below the
+/// one with nothing else in use, it says what is held and free, that limit, and what to do (#2431).
+fn too_large_held(len: u64, max: u64, memory: Option<u64>, held: u64, free: Option<u64>) -> String {
+    let file = size_said(len, true);
+    let Some(memory) = memory else {
+        return format!("file is too large ({file}; the most read into memory is {})", size_said(max, false));
     };
-    format!("file is too large ({}; the most read into memory is {limit})", size_said(len, true))
+    let full = max_bytes_for(Some(memory));
+    if max >= full || (held == 0 && free.is_none()) {
+        return format!(
+            "file is too large ({file}; the most read into memory is {} on this computer, a limit that follows its memory)",
+            size_said(max, false)
+        );
+    }
+    let free = free.map(|free| format!(" and {} free", size_said(free, false))).unwrap_or_default();
+    format!(
+        "file is too large ({file}; the most read into memory is {} on this computer now, with RustGIS holding {}{free}, {} otherwise): free memory by removing layers or tables you no longer need (save and reopen the project to let go of what Undo keeps of them) or closing other programs, then try again",
+        size_said(max, false),
+        size_said(held, true),
+        size_said(full, false)
+    )
 }
 
 /// A size in MiB, rounded `up` (a file's, so it never looks within the limit) or down (the
@@ -328,7 +360,7 @@ pub fn read_layers(file_name: &str, bytes: &[u8]) -> Result<Vec<LayerRead>> {
 
 /// The extension of a file from its first bytes, for a download whose address doesn't say:
 /// GeoParquet, FlatGeobuf, GeoTIFF, a zip, a GeoPackage, an ArcGIS feature service's protocol
-/// buffer answer (`pbf`), KML, GPX, GeoJSON, delimited text, JPEG 2000 or a PDF (`None` for
+/// buffer answer (`pbf`), KML, GPX, GeoJSON, delimited text, JPEG 2000, a PDF or GRIB (`None` for
 /// anything else, such as a web page).
 pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
     if let Some(ext) = crate::raster::jpeg2000_extension(bytes) {
@@ -354,6 +386,8 @@ pub fn sniff_extension(bytes: &[u8]) -> Option<&'static str> {
         [b'P', b'K', 3, 4, ..] => "zip",
         _ if bytes.starts_with(b"SQLite format 3\0") => "gpkg",
         _ if bytes.starts_with(b"%PDF-") => "pdf",
+        // A GRIB message of edition 1 or 2 (a byte range of a model's file starts with one).
+        [b'G', b'R', b'I', b'B', _, _, _, 1 | 2, ..] => "grb",
         // LiDAR: LAZ marks its point format's top bits.
         _ if crate::lidar::looks_like_las(bytes) => {
             if bytes.get(104).is_some_and(|f| f & 0xC0 != 0) {
@@ -483,10 +517,10 @@ pub fn read_path(path: &Path) -> Result<(Dataset, ReadReport)> {
         }
         "dbf" => {
             check_size(path)?;
-            let mut notes = Vec::new();
+            let mut notes = crate::loss::Notes::new();
             let cpg = crate::dbf::read_cpg(path, &mut notes);
             let (ds, mut report) = read_dbf(std::fs::read(path)?, cpg.as_deref(), &name, &mut csv_memory_budget())?;
-            report.messages.extend(notes);
+            report.messages.extend(notes.prefixed(&name));
             (ds, report)
         }
         "shp" => read_shapefile_in(path, &name, None)?,
@@ -557,8 +591,27 @@ pub fn write_bytes(ds: &Dataset, ext: &str) -> Result<(Vec<u8>, usize)> {
 }
 
 /// The formats that can be written in a coordinate system other than WGS 84 longitude/latitude
-/// (GeoJSON, KML and GPX are longitude/latitude by definition).
-pub const PROJECTED_FORMATS: [&str; 4] = ["gpkg", "shp", "zip", "fgb"];
+/// (GeoJSON, KML and GPX are longitude/latitude by definition). GeoParquet takes only a system with
+/// an EPSG code ([`check_projected`]).
+pub const PROJECTED_FORMATS: [&str; 6] = ["gpkg", "shp", "zip", "fgb", "parquet", "geoparquet"];
+
+/// Whether a format of extension `ext` can be written in a coordinate system other than WGS 84
+/// longitude/latitude when one is asked for: those of [`PROJECTED_FORMATS`], and CSV, whose x and
+/// y columns are then in it, though the file can't say which system that is
+/// ([`csv_system_note`]); CSV is never written in another by default.
+pub fn holds_a_system(ext: &str) -> bool {
+    let ext = ext.to_ascii_lowercase();
+    PROJECTED_FORMATS.contains(&ext.as_str()) || ext == "csv"
+}
+
+/// What is said of a CSV export of a point layer written in `crs` other than longitude/latitude:
+/// the file can't say its system, so adding it back needs it given. `None` otherwise.
+pub fn csv_system_note(path: &str, geometry_type: GeometryType, crs: Crs) -> Option<String> {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    (ext == "csv" && geometry_type == GeometryType::Point && crs != Crs::LonLat).then(|| {
+        format!("{path}: its coordinates are in {}, which a CSV file can't say; give that system when adding it back", crs.label())
+    })
+}
 
 /// The coordinate system an export to extension `ext` is written in when none is asked for: the
 /// one the dataset was read in, for a format that can say it, else WGS 84. A system without an
@@ -578,22 +631,69 @@ pub fn default_export_note(ds: &Dataset, path: &str) -> Option<String> {
     let own = ds.crs.filter(|&c| c != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str()))?;
     (default_export_crs(ds, &ext) == Crs::LonLat).then(|| {
         format!(
-            "{path}: the coordinate system of {} ({}) has no EPSG code and no WKT definition RustGIS can write, so it is written in WGS 84 (EPSG:4326); give a \"crs\" to write another",
+            "{path}: the coordinate system of {} ({}) {}, so it is written in WGS 84 (EPSG:4326); give a \"crs\" to write another",
             ds.name,
-            own.label()
+            own.label(),
+            unwritable(&ext, own)
         )
     })
 }
 
-/// The dataset (in longitude/latitude, as every dataset is) in `crs`'s coordinates. Fails on a
-/// coordinate the system can't hold, naming its feature.
+/// Why a system can't be written to a file with extension `ext` ([`check_projected`]).
+fn unwritable(ext: &str, crs: Crs) -> &'static str {
+    if !matches!(ext, "parquet" | "geoparquet") {
+        "has no EPSG code and no WKT definition RustGIS can write"
+    } else if crs.epsg() == 0 {
+        "has no EPSG code"
+    } else {
+        "has no PROJJSON definition RustGIS can write"
+    }
+}
+
+/// The system an export to `path` is written in when none is asked for, and what is said of it,
+/// in a project whose coordinate system is `project` (#2032 C3a): as [`default_export_crs`] and
+/// [`default_export_note`] for a dataset with a system of its own, or in a project without one. A
+/// dataset with none of its own, in longitude/latitude, is written in the project's where the
+/// format can say it, and that is said; in WGS 84, said, when the format can't hold that system.
+/// Places that system can't hold are written as any export into it writes them (at 85.05° in Web
+/// Mercator, said).
+pub fn default_export_in(ds: &Dataset, path: &str, project: Option<Crs>) -> (Crs, Option<String>) {
+    let ext = Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let project = project.filter(|p| {
+        ds.crs.is_none()
+            && ds.coord_crs() == Crs::LonLat
+            && *p != Crs::LonLat
+            && !p.is_geocentric()
+            && PROJECTED_FORMATS.contains(&ext.as_str())
+    });
+    let Some(p) = project else { return (default_export_crs(ds, &ext), default_export_note(ds, path)) };
+    let in_wgs84 = |why: String| {
+        (
+            Crs::LonLat,
+            Some(format!(
+                "{path}: written in WGS 84 (EPSG:4326), not the project's coordinate system ({}), as {why}; give a \"crs\" to write another",
+                p.label()
+            )),
+        )
+    };
+    if check_projected(&ext, p).is_err() {
+        return in_wgs84(format!("that {}", unwritable(&ext, p)));
+    }
+    (p, Some(format!("{path}: written in {}, the project's coordinate system, as {} has none of its own", p.label(), ds.name)))
+}
+
+/// The dataset in `crs`'s coordinates, from the system it holds them in ([`Dataset::coord_crs`]),
+/// by the direct operation between the two ([`Crs::to`]). A copy as it is when it holds them in
+/// `crs`. Fails on a coordinate the system can't hold, naming its feature.
 pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
-    if crs == Crs::LonLat {
+    let from = ds.coord_crs();
+    if crs == from {
         return Ok(ds.clone());
     }
     let mut out = ds.clone();
-    let to = Crs::LonLat.to(crs).map_err(DataError::Format)?;
+    let to = from.to(crs).map_err(DataError::Format)?;
     project_features(&mut out.features, &to)?;
+    out.held_in = crs;
     Ok(out)
 }
 
@@ -602,6 +702,75 @@ pub fn project(ds: &Dataset, crs: Crs) -> Result<Dataset> {
 pub(crate) fn project_features(features: &mut [crate::Feature], to: &crate::raster::Reprojection) -> Result<()> {
     crate::progress::begin(features.len());
     project_each(features, to, true)
+}
+
+/// [`project`] for an export: a feature with a place `crs` can't hold keeps its attributes and is
+/// written without its geometry, rather than failing the export; returns how many were
+/// ([`unplaced_export_note`]).
+pub fn project_leaving_out(ds: &Dataset, crs: Crs) -> Result<(Dataset, usize)> {
+    let from = ds.coord_crs();
+    if crs == from {
+        return Ok((ds.clone(), 0));
+    }
+    let mut out = ds.clone();
+    let to = from.to(crs).map_err(DataError::Format)?;
+    crate::progress::begin(out.features.len());
+    let unplaced = project_each_leaving_out(&mut out.features, &to, true)?;
+    out.held_in = crs;
+    Ok((out, unplaced))
+}
+
+/// [`project_each`] for an export: a feature with a place the target can't hold loses its
+/// geometry rather than failing; returns how many did. A coordinate that is missing already (NaN,
+/// infinite) stays missing, as [`crate::Dataset::in_lonlat`] keeps it, and loses nothing.
+pub(crate) fn project_each_leaving_out(features: &mut [crate::Feature], to: &crate::raster::Reprojection, count: bool) -> Result<usize> {
+    let mut unplaced = 0usize;
+    for f in features {
+        if count {
+            crate::progress::step(1)?;
+        } else {
+            crate::progress::check()?;
+        }
+        if let Some(g) = f.geometry.take() {
+            // A coordinate that isn't a number is kept as it is: converting it could give it a
+            // place (Web Mercator takes an infinite latitude to 85.05°).
+            let out = if to.is_identity() {
+                g.clone()
+            } else {
+                g.map_coords(&|c| if c.is_finite() { to.point(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)) } else { c })
+            };
+            if lost_a_place(&g, &out) {
+                unplaced += 1;
+            } else {
+                f.geometry = Some(out);
+            }
+        }
+    }
+    Ok(unplaced)
+}
+
+/// Whether `out`, `g` converted place for place, lost a place: one that was a number in `g` and
+/// isn't in `out`.
+fn lost_a_place(g: &Geometry, out: &Geometry) -> bool {
+    let mut was = Vec::new();
+    g.for_each_coord(|c| was.push(c.is_finite()));
+    let mut k = 0usize;
+    let mut lost = false;
+    out.for_each_coord(|c| {
+        lost |= was.get(k).copied().unwrap_or(true) && !c.is_finite();
+        k += 1;
+    });
+    lost
+}
+
+/// What an export to `target` says of the `n` features of `layer` with a place `crs` can't hold
+/// ([`project_leaving_out`]): their geometry is left out, and in a format that holds only
+/// features with geometry the feature too. `None` for none.
+pub fn unplaced_export_note(target: &str, layer: &str, n: usize, crs: Crs) -> Option<String> {
+    let system = if crs == Crs::LonLat { "WGS 84 (EPSG:4326)".to_string() } else { crs.label() };
+    (n > 0).then(|| {
+        format!("{target}: {n} feature(s) of {layer} have a place that can't be given in {system}, so their geometry is left out (and the feature, in a format that holds only features with geometry)")
+    })
 }
 
 /// [`project_features`] without a step of its own: it counts each feature in the step under way
@@ -623,23 +792,31 @@ pub(crate) fn project_each(features: &mut [crate::Feature], to: &crate::raster::
     Ok(())
 }
 
-/// Defines the CRS of the dataset's native coordinates without changing those numeric values.
-/// Geometry stored in longitude/latitude is converted back through the previous CRS, then
-/// interpreted in the new one. Builds a copy so failed transformations leave the input intact.
+/// Defines the CRS of the dataset's native coordinates without changing those numeric values: a
+/// relabel. Its coordinates as the file held them (in the system it is held in, else the one it was
+/// read in, [`Dataset::crs`], or longitude/latitude without one) are held in `crs` as they are; a
+/// dataset held in longitude/latitude while it says another system (a project saved by an older
+/// release) has its coordinates brought back to that system first. Refused when a place can't be
+/// given in longitude/latitude from `crs`. Builds a copy so a refusal leaves the input intact.
 /// Source geometry discarded during import cannot be recovered this way.
 pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
     if ds.crs_incomplete {
         return Err(DataError::Format("geometry was lost during import; import the original file again with a crs override".into()));
     }
-    let from = ds.crs.unwrap_or(Crs::LonLat);
-    let native = project(ds, from)?;
+    // The system its numbers are in: the one it is held in, or, for a layer held in
+    // longitude/latitude, the one it was read in (a project saved by an older release).
+    let from = match ds.coord_crs() {
+        Crs::LonLat => ds.crs.unwrap_or(Crs::LonLat),
+        held => held,
+    };
+    // As they are while held in the system it was read in, as a file read now is.
+    let mut out = project(ds, from)?;
     let to = crs.to(Crs::LonLat).map_err(DataError::Format)?;
-    let mut out = native;
-    for f in &mut out.features {
-        if let Some(g) = f.geometry.take() {
-            let g = to.geometry(&g);
+    for f in &out.features {
+        if let Some(g) = &f.geometry {
+            let lonlat = to.geometry(g);
             let mut valid = true;
-            g.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
+            lonlat.for_each_coord(|c| valid &= c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
             if !valid {
                 return Err(DataError::Format(format!(
                     "feature {} can't be interpreted in {}; import the original file with a crs override",
@@ -647,17 +824,22 @@ pub fn define_projection(ds: &Dataset, crs: Crs) -> Result<Dataset> {
                     crs.label()
                 )));
             }
-            f.geometry = Some(g);
         }
     }
+    out.held_in = crs;
     out.crs = Some(crs);
     Ok(out)
 }
 
-/// Refuses a system for a GeoPackage or FlatGeobuf that the file couldn't declare: one without an
+/// Refuses a system for a GeoParquet that has no EPSG code ([`crate::source::parquet::projjson`]),
+/// and for a GeoPackage or FlatGeobuf that the file couldn't declare: one without an
 /// EPSG code is declared by its WKT definition, and without one (a projection WKT1 has no name
 /// for) the file would read as longitude/latitude.
 pub(crate) fn check_projected(ext: &str, crs: Crs) -> Result<()> {
+    // GeoParquet says a system by PROJJSON with its EPSG code, which every release reads.
+    if matches!(ext, "parquet" | "geoparquet") && crs != Crs::LonLat && crate::source::parquet::projjson(crs).is_none() {
+        return Err(DataError::Unsupported(format!(".{ext} in {}: {}", crs.label(), crate::source::parquet::projjson_refusal(crs))));
+    }
     if crs.epsg() == 0 && matches!(ext, "gpkg" | "fgb") && crate::raster::wkt::to_wkt(crs).is_none() {
         return Err(DataError::Unsupported(format!(
             ".{ext} in {}: it has no EPSG code or WKT definition; give the system as an EPSG code",
@@ -669,16 +851,41 @@ pub(crate) fn check_projected(ext: &str, crs: Crs) -> Result<()> {
 
 /// As [`write_bytes`], in the coordinate system `crs`: a GeoPackage, Shapefile or FlatGeobuf (see
 /// [`PROJECTED_FORMATS`]) says it; any other format is written only in longitude/latitude.
+/// Refused on a place `crs` can't hold, naming its feature; [`write_bytes_noted`] writes the
+/// feature without its geometry instead, and says so.
 pub fn write_bytes_in(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)> {
     let ext = ext.to_ascii_lowercase();
     if crs != Crs::LonLat {
-        if !PROJECTED_FORMATS.contains(&ext.as_str()) {
+        if !holds_a_system(&ext) {
             return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
         }
         check_projected(&ext, crs)?;
-        return projected_bytes(&project(ds, crs)?, &ext, crs);
     }
-    projected_bytes(ds, &ext, crs)
+    // From the system the dataset holds its coordinates in: as they are when that is `crs`.
+    if crs == ds.coord_crs() {
+        return projected_bytes(ds, &ext, crs);
+    }
+    projected_bytes(&project(ds, crs)?, &ext, crs)
+}
+
+/// [`write_bytes_in`] for an export (named `name` in its notes): a feature with a place `crs`
+/// can't hold is written without its geometry ([`project_leaving_out`]), and the notes say how
+/// many ([`unplaced_export_note`]).
+pub fn write_bytes_noted(ds: &Dataset, ext: &str, crs: Crs, name: &str) -> Result<(Vec<u8>, usize, Vec<String>)> {
+    let ext = ext.to_ascii_lowercase();
+    if crs != Crs::LonLat {
+        if !holds_a_system(&ext) {
+            return Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())));
+        }
+        check_projected(&ext, crs)?;
+    }
+    if crs == ds.coord_crs() {
+        let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
+        return Ok((bytes, left_out, Vec::new()));
+    }
+    let (projected, unplaced) = project_leaving_out(ds, crs)?;
+    let (bytes, left_out) = projected_bytes(&projected, &ext, crs)?;
+    Ok((bytes, left_out, unplaced_export_note(name, &ds.name, unplaced, crs).into_iter().collect()))
 }
 
 /// [`write_bytes_in`] for a dataset already in `crs`'s coordinates.
@@ -690,9 +897,9 @@ fn projected_bytes(ds: &Dataset, ext: &str, crs: Crs) -> Result<(Vec<u8>, usize)
             w.write(&ds.features)?;
             (w.finish()?, 0)
         }
-        "csv" => (to_csv(ds)?.into_bytes(), 0),
+        "csv" => (to_csv_in(ds, crs)?.into_bytes(), 0),
         "fgb" => (crate::source::fgb::write_in(ds, crs)?, without_geometry(ds)),
-        "parquet" | "geoparquet" => (crate::source::parquet::write(ds)?, 0),
+        "parquet" | "geoparquet" => (crate::source::parquet::write_in(ds, crs)?, 0),
         "kml" => (crate::interop::to_kml(ds, name_field(ds))?.into_bytes(), without_geometry(ds)),
         "kmz" => {
             let kml = crate::interop::to_kml(ds, name_field(ds))?.into_bytes();
@@ -749,23 +956,46 @@ pub struct GpkgWritten {
 }
 
 /// As [`write_path`], in the coordinate system `crs` (a GeoPackage, Shapefile or FlatGeobuf; see
-/// [`write_bytes_in`]).
+/// [`write_bytes_in`]). Refused on a place `crs` can't hold, naming its feature, as it gives no
+/// notes to say it; [`write_path_to`] writes the feature without its geometry instead, and says so.
 pub fn write_path_in(ds: &Dataset, path: &Path, crs: Crs) -> Result<usize> {
-    write_path_to(ds, path, crs, &GpkgTable::default()).map(|(left_out, _)| left_out)
+    write_path_as(ds, path, crs, &GpkgTable::default(), false).map(|(left_out, _, _)| left_out)
 }
 
 /// As [`write_path_in`], a GeoPackage's table placed as `gpkg` says (other formats ignore it):
-/// also returns the table written.
-pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>)> {
+/// also returns the table written, and notes to give with the export (a Shapefile's old parts it
+/// couldn't remove once the new ones landed, [`kept_backups_note`]). A feature with a place `crs`
+/// can't hold is written without its geometry, and the notes say how many
+/// ([`unplaced_export_note`]).
+pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> Result<(usize, Option<GpkgWritten>, Vec<String>)> {
+    write_path_as(ds, path, crs, gpkg, true)
+}
+
+/// [`write_path_to`], leaving out a geometry `crs` can't hold (`leaving_out`, said in the notes)
+/// or refusing it ([`write_path_in`]).
+fn write_path_as(
+    ds: &Dataset,
+    path: &Path,
+    crs: Crs,
+    gpkg: &GpkgTable,
+    leaving_out: bool,
+) -> Result<(usize, Option<GpkgWritten>, Vec<String>)> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if crs != Crs::LonLat && PROJECTED_FORMATS.contains(&ext.as_str()) {
+        check_projected(&ext, crs)?;
+    }
     let projected;
-    let ds = if crs == Crs::LonLat || !PROJECTED_FORMATS.contains(&ext.as_str()) {
+    // From the system the dataset holds its coordinates in ([`project_leaving_out`]): as they are
+    // when that is `crs`, and when `crs` is one the format can't hold, which is refused below. A
+    // feature with a place `crs` can't hold is written without its geometry, and said.
+    let mut unplaced = 0;
+    let ds = if crs == ds.coord_crs() || (crs != Crs::LonLat && !holds_a_system(&ext)) {
         ds
     } else {
-        check_projected(&ext, crs)?;
-        projected = project(ds, crs)?;
+        (projected, unplaced) = if leaving_out { project_leaving_out(ds, crs)? } else { (project(ds, crs)?, 0) };
         &projected
     };
+    let unplaced = unplaced_export_note(&path.display().to_string(), &ds.name, unplaced, crs);
     match ext.as_str() {
         "gpkg" => {
             #[cfg(not(target_arch = "wasm32"))]
@@ -774,7 +1004,7 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
                 // Every feature is written: a layer of several kinds of geometry gets a GEOMETRY
                 // column, and one that declares no type takes its geometry's.
                 let table = crate::source::gpkg::write_table_in(ds, path, crs, gpkg)?;
-                Ok((0, Some(table)))
+                Ok((0, Some(table), unplaced.into_iter().collect()))
             }
             #[cfg(target_arch = "wasm32")]
             {
@@ -786,16 +1016,16 @@ pub fn write_path_to(ds: &Dataset, path: &Path, crs: Crs, gpkg: &GpkgTable) -> R
             crate::progress::begin(ds.features.len());
             let (parts, left_out) = shapefile_parts_in(ds, crs)?;
             let parts: Vec<(std::path::PathBuf, Vec<u8>)> = parts.into_iter().map(|(e, bytes)| (shapefile_part(path, e), bytes)).collect();
-            place_shapefile(path, &stage_shapefile(&parts)?)?;
-            Ok((left_out, None))
+            let kept = place_shapefile(path, &stage_shapefile(&parts)?)?;
+            Ok((left_out, None, unplaced.into_iter().chain(kept_backups_note(path, &kept)).collect()))
         }
-        _ if crs != Crs::LonLat && !PROJECTED_FORMATS.contains(&ext.as_str()) => {
+        _ if crs != Crs::LonLat && !holds_a_system(&ext) => {
             Err(DataError::Unsupported(format!(".{ext} in {} (it holds longitude/latitude only)", crs.label())))
         }
         _ => {
             let (bytes, left_out) = projected_bytes(ds, &ext, crs)?;
             write_atomic(path, &bytes)?;
-            Ok((left_out, None))
+            Ok((left_out, None, unplaced.into_iter().collect()))
         }
     }
 }
@@ -839,7 +1069,11 @@ pub(crate) fn unstage(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
 /// first and put back if any new part fails to land, and a Cancel before the last part lands
 /// rolls back the same way. Once all have landed, the old parts and the spatial indexes that
 /// would no longer match (`.qix`, `.sbn`, `.sbx`) are removed.
-pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::path::PathBuf)]) -> Result<()> {
+///
+/// Returns the old parts that landed but couldn't be removed afterwards, each as the hidden copy
+/// that holds it ([`kept_backups_note`] says them). When a part fails to land and every old part is
+/// put back, the error names `path` and says nothing changed.
+pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::path::PathBuf)]) -> Result<Vec<std::path::PathBuf>> {
     let mut written: Vec<&(std::path::PathBuf, std::path::PathBuf)> = staged.iter().collect();
     written.sort_by_key(|(_, target)| target == path);
     let mut backups: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
@@ -880,11 +1114,14 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
         placed.push(target.clone());
     }
     if let Err(e) = result {
+        // A new part that can't be removed, where no old one is put back over it, is named.
+        let mut kept = Vec::new();
         for p in &placed {
-            let _ = std::fs::remove_file(p);
+            if std::fs::remove_file(p).is_err() && !backups.iter().any(|(_, target)| target == p) {
+                kept.push(format!("the new {} is left", p.display()));
+            }
         }
         // An old part that can't be put back is named, so it isn't lost under its temporary name.
-        let mut kept = Vec::new();
         for (bak, target) in &backups {
             if std::fs::rename(bak, target).is_err() {
                 kept.push(format!("{} is kept as {}", target.display(), bak.display()));
@@ -895,13 +1132,18 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
         sync_folder(path);
         let e = DataError::from(e);
         if kept.is_empty() {
-            return Err(e);
+            // With no old file, there was nothing to put back.
+            let outcome = if backups.is_empty() { "nothing was written" } else { "the old file was put back, nothing changed" };
+            // Its kind kept, for a caller that tells failures apart by it.
+            return Err(match e {
+                DataError::Io(e) => DataError::Io(std::io::Error::new(e.kind(), format!("{}: {e}; {outcome}", path.display()))),
+                e => e,
+            });
         }
-        return Err(DataError::Format(format!("{e}; putting the old file back failed: {}", kept.join(", "))));
+        return Err(DataError::Format(format!("{}: {e}; undoing the write failed: {}", path.display(), kept.join(", "))));
     }
-    for (bak, _) in &backups {
-        let _ = std::fs::remove_file(bak);
-    }
+    // A copy that can't be removed is returned, to be said: it holds an old part beside the file.
+    let left: Vec<std::path::PathBuf> = backups.into_iter().filter(|(bak, _)| remove_backup(bak).is_err()).map(|(bak, _)| bak).collect();
     // A spatial index left from an older file of the same name would no longer match.
     for stale in ["qix", "sbn", "sbx"] {
         // Sidecars may use any letter case, even beside a lowercase `.shp`.
@@ -916,7 +1158,37 @@ pub(crate) fn place_shapefile(path: &Path, staged: &[(std::path::PathBuf, std::p
     }
     // Every part is renamed within `path`'s folder.
     sync_folder(path);
-    Ok(())
+    Ok(left)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`remove_backup`] fail on this thread, for the tests of a copy that can't be removed
+    /// (no permission does that alone: the folder must still take the renames).
+    static KEEP_BACKUPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Removes an old part's copy once the new parts have landed ([`place_shapefile`]).
+fn remove_backup(bak: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if KEEP_BACKUPS.get() {
+        return Err(std::io::Error::other("kept for the test"));
+    }
+    std::fs::remove_file(bak)
+}
+
+/// What is said of the old parts of the Shapefile at `path` that [`place_shapefile`] couldn't
+/// remove once the new ones landed; `None` when there are none.
+pub(crate) fn kept_backups_note(path: &Path, kept: &[std::path::PathBuf]) -> Option<String> {
+    (!kept.is_empty()).then(|| {
+        let copies: Vec<String> = kept.iter().map(|k| k.display().to_string()).collect();
+        format!(
+            "{}: {} old part(s) couldn't be removed after the new ones landed; they are kept as {} and can be deleted",
+            path.display(),
+            kept.len(),
+            copies.join(", ")
+        )
+    })
 }
 
 /// Makes a rename into `path`'s folder survive a power cut: on Linux and macOS a synced file can
@@ -1024,7 +1296,7 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
     let path = link_target(path)?;
-    atomic_write_at(&path, write)
+    atomic_write_at(path, write)
 }
 
 /// Atomically replaces an app-managed file, replacing a final symbolic link rather than
@@ -1032,25 +1304,104 @@ pub fn write_atomic_with<T, E: From<std::io::Error>>(
 /// regular files keep their permissions; a replaced link uses a new file's permissions.
 pub fn replace_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    atomic_write_at(path, |out| out.write_all(bytes))
+    replace_atomic_with(path, |out| out.write_all(bytes))
 }
 
-/// Stages content beside the chosen destination; errors and cancellation retain the old file.
-fn atomic_write_at<T, E: From<std::io::Error>>(
+/// [`replace_atomic`] with the content written through a buffer, without concatenating it first.
+pub fn replace_atomic_with<T, E: From<std::io::Error>>(
     path: &Path,
     write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
+    atomic_write_at(path.to_path_buf(), write)
+}
+
+/// Writes and syncs bytes beside the destination, preserving the destination until
+/// [`StagedWrite::commit`] installs them. Dropping the result discards the staged file.
+pub fn stage_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<StagedWrite> {
     use std::io::Write;
-    let tmp = temp_beside(path)?;
+    stage_at(link_target(path)?, 8 << 10, |w| w.write_all(bytes)).map(|(staged, ())| staged)
+}
+
+/// [`stage_atomic`] for a write that streams: `write` fills the file beside the destination (a
+/// symbolic link's target), which [`StagedWrite::commit`] installs; dropping the result discards it.
+pub fn stage_streamed<T, E: From<std::io::Error>>(
+    path: &Path,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<(StagedWrite, T), E> {
+    // A streamed write (a raster's tiles) goes through a buffer of a megabyte.
+    stage_at(link_target(path)?, 1 << 20, write)
+}
+
+/// [`stage_streamed`] to a destination nothing holds yet: it is reserved first, an empty file
+/// made in its place only if nothing is there (an `AlreadyExists` error otherwise, before
+/// anything is written), so two writes never pick the same file. [`StagedWrite::commit`] puts
+/// the file there; dropping the result, or an error, removes the reservation, and `folder` (one
+/// the caller just made for it) when nothing else is in it.
+pub fn stage_streamed_new<T, E: From<std::io::Error>>(
+    path: &Path,
+    folder: Option<&Path>,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<(StagedWrite, T), E> {
+    std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut held = Reserved { path: Some(path.to_path_buf()), folder: folder.map(Path::to_path_buf) };
+    let (mut staged, value) = stage_at(path.to_path_buf(), 1 << 20, write)?;
+    (staged.reserved, staged.folder) = (held.path.take(), held.folder.take());
+    Ok((staged, value))
+}
+
+/// A destination reserved for a write ([`stage_streamed_new`]), and a folder made for it, removed
+/// while the write isn't installed: the reservation while it is still empty, the folder while
+/// nothing else is in it.
+struct Reserved {
+    path: Option<std::path::PathBuf>,
+    folder: Option<std::path::PathBuf>,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        unreserve(self.path.take(), self.folder.take());
+    }
+}
+
+/// Removes a reserved destination still empty, then `folder` if nothing else is in it.
+fn unreserve(path: Option<std::path::PathBuf>, folder: Option<std::path::PathBuf>) {
+    if let Some(p) = path
+        && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() && m.len() == 0)
+    {
+        let _ = std::fs::remove_file(p);
+    }
+    if let Some(f) = folder {
+        let _ = std::fs::remove_dir(f);
+    }
+}
+
+/// Stages and installs a write, retaining the old file on error or cancellation.
+fn atomic_write_at<T, E: From<std::io::Error>>(
+    path: std::path::PathBuf,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let (staged, value) = stage_at(path, 8 << 10, write)?;
+    staged.commit()?;
+    Ok(value)
+}
+
+/// Syncs the temporary file on the writing thread, so installation only needs a rename
+/// and a directory sync.
+fn stage_at<T, E: From<std::io::Error>>(
+    path: std::path::PathBuf,
+    buffer: usize,
+    write: impl FnOnce(&mut std::io::BufWriter<std::fs::File>) -> std::result::Result<T, E>,
+) -> std::result::Result<(StagedWrite, T), E> {
+    use std::io::Write;
+    let tmp = temp_beside(&path)?;
     // Opened before the guard, so a name already taken is never removed.
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-    // Removes the file on an error and on a panic in `write` alike, unless it was moved into place.
-    let staged = Staged(&tmp);
+    let staged = StagedWrite { path, tmp: Some(tmp), reserved: None, folder: None };
     // The new file takes the old one's mode before any content is written, so a private file
     // (0600) never becomes readable by others. On Windows a new file inherits its folder's access
     // rules, and copying a read-only flag would only make the rename fail.
     #[cfg(unix)]
-    match std::fs::symlink_metadata(path) {
+    match std::fs::symlink_metadata(&staged.path) {
         Ok(old) if !old.file_type().is_symlink() => {
             use std::os::unix::fs::PermissionsExt;
             let permissions = old.permissions();
@@ -1064,21 +1415,54 @@ fn atomic_write_at<T, E: From<std::io::Error>>(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut out = std::io::BufWriter::new(file);
+    let mut out = std::io::BufWriter::with_capacity(buffer, file);
     let value = write(&mut out)?;
     out.flush()?;
     out.get_ref().sync_all()?;
     // Closed before the rename, including on Windows.
     drop(out);
-    // A cancel that came while it was written leaves the file there before as it was. This is
-    // the last look: the rename commits the file, and a Cancel after it finds it written.
-    if crate::progress::check().is_err() {
-        return Err(std::io::Error::other(DataError::Cancelled).into());
+    Ok((staged, value))
+}
+
+/// An atomic write awaiting installation. An error or drop removes its temporary file, and what
+/// [`stage_streamed_new`] reserved for it.
+pub struct StagedWrite {
+    path: std::path::PathBuf,
+    tmp: Option<std::path::PathBuf>,
+    /// The destination reserved, and the folder made for it ([`stage_streamed_new`]).
+    reserved: Option<std::path::PathBuf>,
+    folder: Option<std::path::PathBuf>,
+}
+
+impl StagedWrite {
+    /// The destination resolved at staging time, after following any symbolic links.
+    pub fn destination(&self) -> &Path {
+        &self.path
     }
-    std::fs::rename(&tmp, path)?;
-    std::mem::forget(staged);
-    sync_folder(path);
-    Ok(value)
+
+    /// Installs the staged file, checking Cancel just before the rename. The previous file
+    /// remains in place if installation fails.
+    pub fn commit(mut self) -> std::io::Result<()> {
+        if crate::progress::check().is_err() {
+            return Err(std::io::Error::other(DataError::Cancelled));
+        }
+        if let Some(tmp) = &self.tmp {
+            std::fs::rename(tmp, &self.path)?;
+            self.tmp = None;
+            (self.reserved, self.folder) = (None, None);
+            sync_folder(&self.path);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        if let Some(tmp) = &self.tmp {
+            let _ = std::fs::remove_file(tmp);
+        }
+        unreserve(self.reserved.take(), self.folder.take());
+    }
 }
 
 /// The file a write to `path` replaces: `path` itself, or, when it is a symbolic link, the file
@@ -1106,16 +1490,6 @@ fn link_target(path: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// How many symbolic links in a row [`link_target`] follows, as many as Linux does.
 const MAX_LINKS: usize = 40;
-
-/// A file being written beside its destination: removed when dropped, as an export that
-/// failed or panicked leaves it. A finished export forgets it once the file is renamed.
-struct Staged<'a>(&'a Path);
-
-impl Drop for Staged<'_> {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(self.0);
-    }
-}
 
 // ---------------------------------------------------------------------------------------------
 // GeoJSON (RFC 7946)
@@ -1220,7 +1594,10 @@ fn clip(s: &str) -> String {
 /// An IAU code (another body's system, as GDAL writes `urn:ogc:def:crs:IAU_2015::49900`) is read
 /// as longitude/latitude with a notice when it is planetocentric. Any other IAU code is an error,
 /// because its coordinates would land in the wrong place ([`planetary::declared`]).
-pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>) -> Result<Option<(Crs, crate::raster::Transformer)>> {
+pub(crate) fn declared_crs(
+    root: &Map<String, Json>,
+    messages: &mut crate::loss::Notes,
+) -> Result<Option<(Crs, crate::raster::Transformer)>> {
     let Some(decl) = root.get("crs").filter(|v| !v.is_null()) else { return Ok(None) };
     if let Some(name) = decl.get("properties").and_then(|p| p.get("name")).and_then(Json::as_str).filter(|n| n.len() <= CRS_NAME_MAX)
         && let Some((authority, code)) = iau_name(name)
@@ -1244,7 +1621,10 @@ pub(crate) fn declared_crs(root: &Map<String, Json>, messages: &mut Vec<String>)
                     None => "of an unknown shape".to_string(),
                 },
             };
-            messages.push(format!("GeoJSON crs {shown}: {why}; coordinates are read as longitude/latitude"));
+            messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                format!("GeoJSON crs {shown}: {why}; coordinates are read as longitude/latitude"),
+            ));
             None
         }
     })
@@ -1289,7 +1669,7 @@ fn legacy_crs(decl: &Json) -> std::result::Result<Option<(Crs, crate::raster::Tr
 /// `http(s)://www.opengis.net/def/crs/EPSG/<version>/N`, or CRS84 as `CRS84`, `OGC:CRS84`,
 /// `urn:ogc:def:crs:OGC:<version, maybe empty>:CRS84` or
 /// `http(s)://www.opengis.net/def/crs/OGC/<version>/CRS84` (any case, whitespace around).
-fn is_epsg_or_crs84_name(name: &str) -> bool {
+pub(crate) fn is_epsg_or_crs84_name(name: &str) -> bool {
     let up = name.trim().to_ascii_uppercase();
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     let version = |s: &str| s.bytes().all(|b| b.is_ascii_digit() || b == b'.');
@@ -1319,14 +1699,59 @@ fn is_epsg_or_crs84_name(name: &str) -> bool {
     up == "CRS84" || up == "OGC:CRS84" || up.strip_prefix("OGC:").and_then(|rest| tail(rest, ':')).is_some_and(|c| c == "CRS84")
 }
 
-/// A geometry in longitude/latitude from the coordinates `t` converts: `None` when a coordinate
-/// can't be converted or comes out beyond longitude/latitude (a declared system that doesn't match
-/// the coordinates).
-pub(crate) fn geometry_to_lonlat(g: &Geometry, t: &crate::raster::Transformer) -> Option<Geometry> {
+/// The box in longitude/latitude of `g`'s places, in the system `t` converts: `None` when one of
+/// them has no place there (none that is finite). A reader keeps the geometry as the file holds
+/// it, held in its system ([`Dataset::held_in`]), either way, and counts those with none
+/// ([`kept_unplaced_note`]) and those whose box comes out beyond longitude/latitude
+/// ([`beyond_lonlat_note`]). Each coordinate is converted to be checked, none is kept.
+pub(crate) fn places_lonlat_extent(g: &Geometry, t: &crate::raster::Transformer) -> Option<rustgis_geom::Extent> {
     let mut ok = true;
-    let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-    out.for_each_coord(|c: Coord| ok &= c.is_finite() && c.x.abs() <= 180.5 && c.y.abs() <= 90.5);
-    ok.then_some(out)
+    let mut e = rustgis_geom::Extent::EMPTY;
+    g.for_each_coord(|c: Coord| match t.to_lonlat(c).filter(|l| l.is_finite()) {
+        Some(l) => e.expand(l),
+        None => ok = false,
+    });
+    ok.then_some(e)
+}
+
+/// What a reader says of the `n` of its `what` (features, shapes, rows) it keeps as the file holds
+/// them, held in `crs`, though a place of theirs can't be given in longitude/latitude: they don't
+/// draw (the map says so too), and a step that needs longitude/latitude leaves them out and says
+/// so, or refuses naming one where leaving it out would lose it (a write-back, a sync of an
+/// offline area holding it, a Field Package's list of changes) or a contract says so (the plugin
+/// host's layers) (#2032 C2f-4b). `all` when none of the file's has a place there: then its system
+/// doesn't seem to match its coordinates, and Define Projection can set the one that does, as
+/// nothing was lost. `None` for none.
+pub(crate) fn kept_unplaced_note(what: &str, n: usize, all: bool, crs: Crs) -> Option<String> {
+    (n > 0).then(|| {
+        if all {
+            format!(
+                "none of the {what} has a place in longitude/latitude from {}: it doesn't seem to be their coordinate system. They are kept as the file holds them, but don't draw; Define Projection can set the right one",
+                crs.label()
+            )
+        } else {
+            let system = crs.label();
+            if n == 1 {
+                format!("one of the {what} has a place in {system} that can't be given in longitude/latitude: it is kept as the file holds it, but doesn't draw")
+            } else {
+                format!("{n} {what} have a place in {system} that can't be given in longitude/latitude: they are kept as the file holds them, but don't draw")
+            }
+        }
+    })
+}
+
+/// What a reader says of the `n` of its `what` whose places convert from `crs` but come out beyond
+/// longitude/latitude (their box there is, [`rustgis_geom::Extent::beyond_lonlat`]): the system
+/// may not be theirs, and they may draw out of place. `None` for none.
+pub(crate) fn beyond_lonlat_note(what: &str, n: usize, crs: Crs) -> Option<String> {
+    let system = crs.label();
+    (n > 0).then(|| {
+        if n == 1 {
+            format!("one of the {what} has coordinates that come out beyond longitude/latitude once converted from {system}: it may not be their coordinate system, and it may draw out of place")
+        } else {
+            format!("{n} {what} have coordinates that come out beyond longitude/latitude once converted from {system}: it may not be their coordinate system, and they may draw out of place")
+        }
+    })
 }
 
 /// What takes a FeatureCollection's features as they're read.
@@ -1335,6 +1760,10 @@ pub(crate) trait FeatureSink {
     fn restart(&mut self);
     /// One element of `"features"`, as its text.
     fn feature(&mut self, raw: &str);
+    /// Whether the read is to stop now (Cancel pressed): it then ends with an error.
+    fn stopped(&self) -> bool {
+        false
+    }
 }
 
 /// Reads a GeoJSON document's top level, handing each element of `"features"` to `sink` as it is
@@ -1403,9 +1832,13 @@ impl<'de> serde::de::Visitor<'de> for Features<'_> {
         f.write_str("an array of features")
     }
 
+    /// Hands each element to the sink as its text, ending with an error once the sink is stopped.
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<(), A::Error> {
         while let Some(raw) = seq.next_element::<&'de serde_json::value::RawValue>()? {
             self.sink.feature(raw.get());
+            if self.sink.stopped() {
+                return Err(serde::de::Error::custom("cancelled"));
+            }
         }
         Ok(())
     }
@@ -1557,27 +1990,32 @@ impl Collector {
         let mut ds = Dataset::new(name, GeometryType::None, fields);
         ds.features.reserve(self.features.len());
         if report.skipped > 0 {
-            report.messages.push(format!("{} features had unreadable geometry", report.skipped));
+            report.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedFeature,
+                format!("{} features had unreadable geometry", report.skipped),
+            ));
         }
-        let declared = declared_crs(root, &mut report.messages)?;
-        let mut unconverted = 0usize;
+        let mut said = crate::loss::Notes::new();
+        let declared = declared_crs(root, &mut said)?;
+        report.messages.extend(said);
+        let (mut unconverted, mut placed) = (0usize, 0usize);
+        let mut beyond = 0usize;
         // Only features kept count toward the heights dropped.
         let mut zm = 0usize;
         // Features kept, as longitude/latitude, with a latitude past the poles.
         let mut swapped = 0usize;
         for (n, (geom, values, had_z)) in self.features.into_iter().enumerate() {
-            // A feature that can't be converted is dropped, and its id is not reused, as when the
-            // file is read in place.
-            let geom = match (&declared, geom) {
-                (Some((_, t)), Some(g)) => match geometry_to_lonlat(&g, t) {
-                    Some(g) => Some(g),
-                    None => {
-                        unconverted += 1;
-                        continue;
+            // Kept as the file holds it, in its declared system, and counted when it has no place
+            // in longitude/latitude ([`places_lonlat_extent`]), as when the file is read in place.
+            if let (Some((_, t)), Some(g)) = (&declared, &geom) {
+                match places_lonlat_extent(g, t) {
+                    Some(e) => {
+                        placed += 1;
+                        beyond += usize::from(e.beyond_lonlat());
                     }
-                },
-                (_, g) => g,
-            };
+                    None => unconverted += 1,
+                }
+            }
             let mut attrs = vec![Value::Null; ds.fields.len()];
             for (i, v) in values {
                 if let (Some(slot), Some(field)) = (attrs.get_mut(i), ds.fields.get(i)) {
@@ -1585,23 +2023,16 @@ impl Collector {
                 }
             }
             zm += usize::from(had_z);
-            // Converted geometry is already within ±90.5° (or dropped above), so only what is read
-            // as longitude/latitude can be swapped.
+            // Only what is read as longitude/latitude can be swapped.
             swapped += usize::from(declared.is_none() && geom.as_ref().is_some_and(latitude_past_poles));
             ds.features.push(crate::Feature { id: n as u64 + 1, geometry: geom, attrs });
         }
         ds.geometry_type = dominant_type(&ds);
         if let Some((crs, _)) = &declared {
             ds.crs = Some(*crs);
-            if unconverted > 0 {
-                report.skipped += unconverted;
-                report.messages.push(format!(
-                    "{unconverted} features couldn't be converted from {} to longitude/latitude and were skipped",
-                    crs.label()
-                ));
-            }
-            // What couldn't be converted can't come back by defining the projection again.
-            ds.crs_incomplete = unconverted > 0;
+            ds.held_in = *crs;
+            report.messages.extend(kept_unplaced_note("features", unconverted, placed == 0, *crs));
+            report.messages.extend(beyond_lonlat_note("features", beyond, *crs));
         }
         report.messages.extend(swapped_latitude_note(swapped));
         // Last, as a source read in place notes it.
@@ -1681,13 +2112,17 @@ pub(crate) fn dominant_type(ds: &Dataset) -> GeometryType {
     }
 }
 
-/// A dataset as a GeoJSON FeatureCollection value, in longitude/latitude.
+/// A dataset as a GeoJSON FeatureCollection value, of its coordinates as they are. GeoJSON is in
+/// longitude/latitude, so a dataset held in another system ([`Dataset::coord_crs`]) is converted
+/// first, by [`Dataset::in_lonlat`], which refuses, naming the feature, a place that can't be
+/// given there; a writer that adds a legacy `crs` member passes its own system's coordinates.
 pub fn to_geojson(ds: &Dataset) -> Json {
     let features: Vec<Json> = ds.features.iter().map(|f| feature_to_geojson(&ds.fields, f)).collect();
     json!({"type": "FeatureCollection", "name": ds.name, "features": features})
 }
 
-/// A GeoJSON text conversion with per-feature progress and cancellation.
+/// A GeoJSON text conversion with per-feature progress and cancellation, of `ds`'s coordinates as
+/// they are: the caller converts a dataset held in another system first ([`Dataset::in_lonlat`]).
 pub fn to_geojson_text(ds: &Dataset) -> Result<String> {
     let mut writer = GeoJsonWriter::new(Vec::new(), &ds.name, &ds.fields)?;
     writer.write(&ds.features)?;
@@ -2310,9 +2745,10 @@ fn read_gzip_text_budget(
 
 /// Estimated memory for retained CSV rows and the dataset built alongside them: a quarter
 /// of physical memory, between 256 MiB (also the browser limit) and 4 GiB.
+/// Less once RustGIS holds more than half the memory, never below the floor ([`crate::memory::planned`], #2431).
 fn csv_memory_budget() -> usize {
     let ceiling = usize::try_from(4u64 << 30).unwrap_or(usize::MAX);
-    crate::memory::scaled(crate::memory::physical(), 256 << 20, ceiling, 1)
+    crate::memory::planned(256 << 20, ceiling, 1)
 }
 
 /// Collects records for type inference, charging text and row/cell objects before copying.
@@ -2471,7 +2907,9 @@ pub(crate) fn read_rows(
         report.messages.push(note);
     }
     if malformed > 0 {
-        report.messages.push(format!("{malformed} rows were malformed and skipped"));
+        report
+            .messages
+            .push(crate::loss::Note::loss(crate::loss::LossCode::DroppedFeature, format!("{malformed} rows were malformed and skipped")));
     }
     let gt = if xy.is_some() { GeometryType::Point } else { GeometryType::None };
     let mut ds = Dataset::new(name, gt, fields);
@@ -2492,9 +2930,14 @@ pub(crate) fn read_rows(
                 .push(format!("{n} values in '{column}' aren't dates and were read as empty, so their rows have no geometry")),
         }
     }
-    let (mut bad_wkt, mut zm_rows) = (0usize, 0usize);
+    let (mut bad_wkt, mut zm_rows, mut collection_rows) = (0usize, 0usize, 0usize);
+    let (mut extra_cells, mut extra_rows) = (0usize, 0usize);
     for r in rows {
         crate::progress::step(1)?;
+        // Only header-defined columns are retained below; count actual cells, including empty ones.
+        let extra = r.len().saturating_sub(headers.len());
+        extra_cells += extra;
+        extra_rows += usize::from(extra > 0);
         let cell = |i: usize| r.get(i).map(|s| s.trim()).unwrap_or("");
         let geom = if let Some((x, y)) = xy {
             match cell(x).parse::<f64>().ok().zip(cell(y).parse::<f64>().ok()) {
@@ -2507,10 +2950,11 @@ pub(crate) fn read_rows(
         } else if let Some(w) = wkt {
             match cell(w) {
                 "" => None,
-                t => match crate::interop::parse_wkt_zm(t) {
-                    Ok((g, s, zm)) => {
+                t => match crate::interop::parse_wkt_report(t) {
+                    Ok((g, s, zm, members_dropped)) => {
                         srid = srid.or(s);
                         zm_rows += usize::from(zm);
+                        collection_rows += usize::from(members_dropped);
                         g
                     }
                     Err(_) => {
@@ -2542,12 +2986,33 @@ pub(crate) fn read_rows(
             .collect();
         ds.push_next(geom, attrs);
     }
+    if extra_cells > 0 {
+        let cells = if extra_cells == 1 { "cell" } else { "cells" };
+        let was = if extra_cells == 1 { "was" } else { "were" };
+        let rows = if extra_rows == 1 { "row" } else { "rows" };
+        let columns = if headers.len() == 1 { "column" } else { "columns" };
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedExtraAttributes,
+            format!("{extra_cells} {cells} past the header's {} {columns} {was} omitted in {extra_rows} {rows}", headers.len()),
+        ));
+    }
     ds.drop_zm(&mut report, zm_rows);
+    if collection_rows > 0 {
+        let column = wkt.and_then(|i| headers.get(i)).map_or("", |h| h.trim());
+        let what = if collection_rows == 1 { "WKT value" } else { "WKT values" };
+        report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedGeometry, format!("{collection_rows} {what} in '{column}' lost later non-empty geometry-collection members; only the first non-empty member is kept")));
+    }
     if report.skipped > malformed {
-        report.messages.push(format!("{} rows had no usable coordinates", report.skipped - malformed));
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedGeometry,
+            format!("{} rows had no usable coordinates", report.skipped - malformed),
+        ));
     }
     if bad_wkt > 0 {
-        report.messages.push(format!("{bad_wkt} rows had geometry that isn't readable WKT"));
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedGeometry,
+            format!("{bad_wkt} rows had geometry that isn't readable WKT"),
+        ));
     }
     if wkt.is_some() {
         // The most common kind, as GeoJSON's reader takes it; rows of other kinds are kept (they
@@ -2566,7 +3031,10 @@ pub(crate) fn read_rows(
         (None, Some(code)) => match crate::raster::Crs::from_epsg(code) {
             Some(c) => Some(c),
             None => {
-                report.messages.push(format!("unknown coordinate system SRID {code}; coordinates are read as longitude/latitude"));
+                report.messages.push(crate::loss::Note::loss(
+                    crate::loss::LossCode::AssumedCrs,
+                    format!("unknown coordinate system SRID {code}; coordinates are read as longitude/latitude"),
+                ));
                 None
             }
         },
@@ -2575,25 +3043,25 @@ pub(crate) fn read_rows(
     if let Some(c) = crs.filter(|c| *c != crate::raster::Crs::LonLat) {
         let t = c.transformer().map_err(DataError::Format)?;
         ds.crs = Some(c);
-        let mut lost = 0usize;
-        for f in &mut ds.features {
-            if let Some(g) = f.geometry.take() {
-                let out = g.map_coords(&|p| t.to_lonlat(p).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-                let mut ok = true;
-                out.for_each_coord(|c| ok &= c.is_finite());
-                if ok {
-                    f.geometry = Some(out);
-                } else {
-                    lost += 1;
+        // Kept as the file holds them, in its system; counted where they have no place in
+        // longitude/latitude.
+        ds.held_in = c;
+        let (mut lost, mut placed, mut beyond) = (0usize, 0usize, 0usize);
+        for g in ds.features.iter().filter_map(|f| f.geometry.as_ref()) {
+            match places_lonlat_extent(g, &t) {
+                Some(e) => {
+                    placed += 1;
+                    beyond += usize::from(e.beyond_lonlat());
                 }
+                None => lost += 1,
             }
         }
-        if lost > 0 {
-            report.skipped += lost;
-            report.messages.push(format!("{lost} rows couldn't be converted from {} to longitude/latitude", c.label()));
-        }
+        report.messages.extend(kept_unplaced_note("rows", lost, placed == 0, c));
+        report.messages.extend(beyond_lonlat_note("rows", beyond, c));
     }
-    let read_as_degrees = crs.is_none_or(Crs::is_geographic);
+    // Read as longitude/latitude as they are: no system given, or longitude/latitude itself. A
+    // row a given system can't place is said above, as kept.
+    let read_as_degrees = crs.is_none_or(|c| c == Crs::LonLat);
     let (mut outside, mut zero) = (0usize, 0usize);
     for f in &ds.features {
         crate::progress::check()?;
@@ -2648,30 +3116,71 @@ fn out_of_lonlat(g: &Geometry) -> bool {
 /// otherwise (or with no values) Text. A number whose digits a Double doesn't keep, such as a
 /// 20-digit identifier, keeps its column Text, so no digit is rounded away ([`double_holds`]).
 pub(crate) fn text_type<'a>(vals: impl Iterator<Item = &'a str>) -> FieldType {
-    let mut ty: Option<FieldType> = None;
-    // A whole number a Double can't hold: fine in an Integer column, not in a Double one.
-    let mut whole_past_double = false;
-    for v in vals.map(str::trim).filter(|s| !s.is_empty()) {
+    let mut column = TextColumn::default();
+    vals.for_each(|v| column.add(v));
+    column.ty()
+}
+
+/// [`text_type`] a value at a time, so a column written a chunk at a time is typed as one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextColumn {
+    ty: Option<FieldType>,
+    /// A whole number a Double can't hold: fine in an Integer column, not in a Double one.
+    whole_past_double: bool,
+}
+
+impl TextColumn {
+    /// Adds a value's text; one that is empty once trimmed types nothing.
+    fn add(&mut self, v: &str) {
+        let v = v.trim();
+        if v.is_empty() {
+            return;
+        }
         let t = if has_leading_zero(v) {
             // Identifiers such as ZIP codes keep their leading zeros.
             FieldType::Text
         } else if let Ok(i) = v.parse::<i64>() {
             // A whole number is held when its Double is the same number (in i128: no saturation).
-            whole_past_double |= (i as f64) as i128 != i128::from(i);
+            self.whole_past_double |= (i as f64) as i128 != i128::from(i);
             FieldType::Integer
         } else if double_holds(v) {
             FieldType::Double
         } else {
             FieldType::Text
         };
-        ty = Some(match ty {
-            None => t,
-            Some(prev) => widen(prev, Some(t)),
-        });
+        self.ty = Some(self.ty.map_or(t, |prev| widen(prev, Some(t))));
+        self.settle();
     }
-    match ty {
-        Some(FieldType::Double) if whole_past_double => FieldType::Text,
-        ty => ty.unwrap_or(FieldType::Text),
+
+    /// Adds another chunk of the column.
+    fn merge(&mut self, other: Self) {
+        self.whole_past_double |= other.whole_past_double;
+        self.ty = match self.ty {
+            None => other.ty,
+            Some(prev) => Some(widen(prev, other.ty)),
+        };
+        self.settle();
+    }
+
+    /// Whether the column is Text whatever values follow.
+    fn is_text(self) -> bool {
+        self.ty == Some(FieldType::Text)
+    }
+
+    /// One state for a Text column, however its values came: a column skips the values after it
+    /// is Text, and its chunks then compare equal to the whole.
+    fn settle(&mut self) {
+        if self.is_text() {
+            self.whole_past_double = false;
+        }
+    }
+
+    /// The column's type: Text without values.
+    fn ty(self) -> FieldType {
+        match self.ty {
+            Some(FieldType::Double) if self.whole_past_double => FieldType::Text,
+            ty => ty.unwrap_or(FieldType::Text),
+        }
     }
 }
 
@@ -2794,9 +3303,33 @@ fn csv_coordinate_names(fields: &[Field]) -> [String; 2] {
     [pick("longitude", LON_NAMES), pick("latitude", LAT_NAMES)]
 }
 
+/// The names of a point layer's x and y columns in CSV written in a projected system: `x` and
+/// `y`, which reading takes first when given a projected system, else `easting` and `northing`,
+/// else `x_1` and `y_1` and so on, the first that no field has (ignoring case and spaces).
+fn csv_projected_names(fields: &[Field]) -> [String; 2] {
+    let taken = |name: &str| fields.iter().any(|f| f.name.trim().eq_ignore_ascii_case(name));
+    let pick = |base: &str, other: &str| {
+        let name = [base.to_string(), other.to_string()].into_iter().chain((1..).map(|i| format!("{base}_{i}"))).find(|n| !taken(n));
+        name.unwrap_or_default()
+    };
+    [pick("x", "easting"), pick("y", "northing")]
+}
+
+/// A point layer's coordinate column names in CSV written in `crs`: longitude and latitude ones
+/// for a geographic system, x and y ones for a projected one.
+fn csv_names_in(fields: &[Field], crs: Crs) -> [String; 2] {
+    if crs.is_geographic() { csv_coordinate_names(fields) } else { csv_projected_names(fields) }
+}
+
 /// A dataset as CSV text: its fields, and a point layer's longitude and latitude ([`CsvWriter`]).
 pub fn to_csv(ds: &Dataset) -> Result<String> {
-    let mut w = CsvWriter::new(Vec::new(), &ds.fields, ds.geometry_type)?;
+    to_csv_in(ds, Crs::LonLat)
+}
+
+/// As [`to_csv`], for a dataset whose coordinates are in `crs`: a projected system's go in x and y
+/// columns ([`csv_projected_names`]).
+pub fn to_csv_in(ds: &Dataset, crs: Crs) -> Result<String> {
+    let mut w = CsvWriter::new(Vec::new(), &ds.fields, ds.geometry_type, crs)?;
     w.write(&ds.features)?;
     String::from_utf8(w.finish()?).map_err(|e| DataError::Format(e.to_string()))
 }
@@ -2809,14 +3342,15 @@ pub(crate) struct CsvWriter<W: std::io::Write> {
 }
 
 impl<W: std::io::Write> CsvWriter<W> {
-    /// Writes the header for `fields`, with coordinate columns for a point layer.
-    pub(crate) fn new(out: W, fields: &[Field], geometry_type: GeometryType) -> Result<Self> {
+    /// Writes the header for `fields`, with coordinate columns for a point layer, named for
+    /// `crs`, the system its features' coordinates are in ([`csv_names_in`]).
+    pub(crate) fn new(out: W, fields: &[Field], geometry_type: GeometryType, crs: Crs) -> Result<Self> {
         let mut w = csv::Writer::from_writer(out);
         let point = geometry_type == GeometryType::Point;
         let mut head = Vec::new();
         if point {
             // The coordinate columns come first, before any attributes using recognised names.
-            head.extend(csv_coordinate_names(fields));
+            head.extend(csv_names_in(fields, crs));
         }
         head.extend(fields.iter().map(|f| f.name.clone()));
         w.write_record(&head).map_err(|e| DataError::Format(e.to_string()))?;
@@ -2859,7 +3393,7 @@ pub fn shapefile_for_dbf(path: &Path) -> Option<std::path::PathBuf> {
 
 /// Finds the attributes beside a Shapefile, accepting every ASCII case of `.dbf` in whole
 /// and streamed reads. A missing sidecar keeps the usual lowercase path for the error.
-pub(crate) fn dbf_sidecar(path: &Path) -> std::path::PathBuf {
+pub fn dbf_sidecar(path: &Path) -> std::path::PathBuf {
     ["dbf", "DBF", "Dbf", "dBf", "dbF", "DBf", "DbF", "dBF"]
         .iter()
         .map(|e| path.with_extension(e))
@@ -2880,7 +3414,7 @@ pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(D
     if shx.is_file() {
         check_size_with(&shx, shapefile_size_error)?;
     }
-    let mut notes = Vec::new();
+    let mut notes = crate::loss::Notes::new();
     let parts = ShapefileParts {
         shp: crate::provenance::read(path)?,
         shx: if shx.is_file() { Some(crate::provenance::read(shx)?) } else { None },
@@ -2889,7 +3423,7 @@ pub fn read_shapefile_in(path: &Path, name: &str, crs: Option<Crs>) -> Result<(D
         cpg: crate::dbf::read_cpg(path, &mut notes),
     };
     let (ds, mut report) = read_shapefile_parts(parts, name, crs)?;
-    report.messages.extend(notes);
+    report.messages.extend(notes.prefixed(name));
     Ok((ds, report))
 }
 
@@ -2943,7 +3477,9 @@ pub fn gather_shapefiles(files: Vec<(String, Vec<u8>)>) -> (Vec<(String, Vec<u8>
         }
     }
     // The zip must open again: within the read size and the zip reader's inflated total.
-    let limit = crate::zip::MAX_TOTAL.min(usize::try_from(max_bytes()).unwrap_or(usize::MAX));
+    // Read once for the whole run: it reads what the computer has free (#2431).
+    let max = max_bytes();
+    let limit = crate::zip::MAX_TOTAL.min(usize::try_from(max).unwrap_or(usize::MAX));
     let (mut out, mut problems) = (Vec::new(), Vec::new());
     for (file, parts) in files.into_iter().zip(zips) {
         out.extend(file);
@@ -2955,8 +3491,8 @@ pub fn gather_shapefiles(files: Vec<(String, Vec<u8>)>) -> (Vec<(String, Vec<u8>
         let total = parts.iter().fold(0usize, |sum, (_, b)| sum.saturating_add(b.len()));
         // Said by the limit it passed: the size read into memory (which follows the computer's
         // memory), or the most a zip expands to.
-        if total as u64 > max_bytes() {
-            problems.push(format!("{shp}: its data files together: {}", too_large(total as u64)));
+        if total as u64 > max {
+            problems.push(format!("{shp}: its data files together: {}", too_large_said(total as u64, max)));
             continue;
         }
         if total > limit {
@@ -2968,8 +3504,8 @@ pub fn gather_shapefiles(files: Vec<(String, Vec<u8>)>) -> (Vec<(String, Vec<u8>
             continue;
         }
         match crate::zip::write(&parts) {
-            Ok(zip) if zip.len() as u64 <= max_bytes() => out.push((zip_name, zip)),
-            Ok(zip) => problems.push(format!("{shp}: zipped together: {}", too_large(zip.len() as u64))),
+            Ok(zip) if zip.len() as u64 <= max => out.push((zip_name, zip)),
+            Ok(zip) => problems.push(format!("{shp}: zipped together: {}", too_large_said(zip.len() as u64, max))),
             Err(e) => problems.push(format!("{shp}: its data files couldn't be zipped together: {e}")),
         }
     }
@@ -3289,13 +3825,27 @@ struct DbfRead {
     fields: Vec<Field>,
     decimals: Vec<u8>,
     report: ReadReport,
+    /// For each field, its text values that aren't valid in the table's encoding
+    /// ([`crate::dbf::not_utf8`]).
+    not_utf8: Vec<usize>,
+    /// The records marked deleted, by position, ascending: the reader gives them as any other
+    /// ([`crate::dbf::take_deleted`]), and they are left out by position.
+    deleted: Vec<usize>,
+    /// The name of that encoding ([`crate::dbf::DbfEncoding::name`]), for the notice.
+    encoding: &'static str,
 }
 
 /// Opens dBASE attributes with the Shapefile reader's code-page and date/number handling.
-fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>) -> Result<DbfRead> {
+/// `name` is the layer's, for the error of a `.dbf` it can't open.
+fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str) -> Result<DbfRead> {
     use std::io::Cursor;
-    let mut encoding_notes = Vec::new();
-    let encoding = crate::dbf::encoding(cpg, bytes.get(29).copied().unwrap_or(0), &mut encoding_notes);
+    let mut declared = crate::loss::Notes::new();
+    let encoding = crate::dbf::encoding(cpg, bytes.get(29).copied().unwrap_or(0), &mut declared);
+    let mut encoding_notes = declared;
+    // Counted before a date column is marked a character one below: its values aren't text.
+    let (names, not_utf8) = crate::dbf::not_utf8(&bytes, &encoding);
+    encoding_notes.extend(crate::dbf::not_utf8_names_note(&names, encoding.name()));
+    let deleted = crate::dbf::take_deleted(&mut bytes);
     crate::dbf::readable_header_date(&mut bytes);
     let date_columns = crate::dbf::dates_as_text(&mut bytes);
     crate::dbf::floats_as_numeric(&mut bytes);
@@ -3305,7 +3855,7 @@ fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>) -> Result<DbfRead> {
         // A date's year may be padded with spaces on the left (`   10101`): keep them.
         .with_options(shapefile::dbase::ReadingOptions::default().character_trim(shapefile::dbase::TrimOption::End))
         .build(Cursor::new(bytes))
-        .map_err(|e| DataError::Format(format!("Shapefile: the .dbf: {e}")))?;
+        .map_err(|e| DataError::Format(format!("{name}: the .dbf: {e}")))?;
     // Field order comes from the .dbf header (records are unordered maps).
     let order: Vec<(String, FieldType)> = dbf
         .fields()
@@ -3325,7 +3875,8 @@ fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>) -> Result<DbfRead> {
         })
         .collect();
     let fields = order.into_iter().map(|(n, t)| Field::new(n, t)).collect();
-    Ok(DbfRead { reader: dbf, fields, decimals, report: ReadReport { messages: encoding_notes, ..Default::default() } })
+    let report = ReadReport { messages: encoding_notes, ..Default::default() };
+    Ok(DbfRead { reader: dbf, fields, decimals, report, not_utf8, deleted, encoding: encoding.name() })
 }
 
 /// Reads a geometry-free dBASE table, checking cancellation and counting progress per record.
@@ -3333,14 +3884,19 @@ fn dbf_reader(mut bytes: Vec<u8>, cpg: Option<&[u8]>) -> Result<DbfRead> {
 /// same budget as delimited tables; archive members share the remaining allowance.
 /// The bounded file read and header decoding finish before cancellation can be observed.
 fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) -> Result<(Dataset, ReadReport)> {
-    let DbfRead { mut reader, fields, decimals, mut report } = dbf_reader(bytes, cpg)?;
+    let DbfRead { mut reader, fields, decimals, mut report, not_utf8, deleted, encoding } = dbf_reader(bytes, cpg, name)?;
     let mut ds = Dataset::new(name, GeometryType::None, fields);
-    let mut counts = DbfCounts::new(ds.fields.len());
+    let mut counts = DbfCounts::new(ds.fields.len(), not_utf8, encoding);
     let allowance = *budget;
     let mut left = allowance;
     crate::progress::begin(reader.header().num_records as usize);
-    for record in reader.iter_records() {
+    let (mut is_deleted, mut left_out) = (deleted_by_position(&deleted), 0);
+    for (k, record) in reader.iter_records().enumerate() {
         crate::progress::step(1)?;
+        if is_deleted(k) {
+            left_out += 1;
+            continue;
+        }
         match record {
             Ok(record) => {
                 let attrs = dbf_attrs(&record, &ds.fields, &mut counts);
@@ -3370,24 +3926,53 @@ fn read_dbf(bytes: Vec<u8>, cpg: Option<&[u8]>, name: &str, budget: &mut usize) 
             Err(_) => report.skipped += 1,
         }
     }
-    // The iterator passes over records marked deleted; the header still counts them.
-    let deleted = (reader.header().num_records as usize).saturating_sub(ds.features.len() + report.skipped);
-    if deleted > 0 {
-        report.messages.push(format!("{name}: {deleted} dBASE records marked deleted were left out"));
-    }
+    report.messages.extend(deleted_records_note(name, left_out, false));
     dbf_notices(&ds, &mut report, &counts);
     integral_numeric_to_integer(&mut ds, &decimals);
-    if report.skipped > 0 {
-        report.messages.push(format!("{name}: {} dBASE records were unreadable and left out", report.skipped));
+    match report.skipped {
+        0 => {}
+        1 => report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedFeature,
+            format!("{name}: 1 dBASE record was unreadable and left out"),
+        )),
+        n => report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedFeature,
+            format!("{name}: {n} dBASE records were unreadable and left out"),
+        )),
     }
     *budget = left;
     Ok((ds, report))
 }
 
+/// Whether the record at a position, asked in ascending order, is one of `deleted` (ascending).
+fn deleted_by_position(deleted: &[usize]) -> impl FnMut(usize) -> bool + '_ {
+    let mut next = deleted.iter().peekable();
+    move |k| {
+        while next.next_if(|d| **d < k).is_some() {}
+        next.next_if(|d| **d == k).is_some()
+    }
+}
+
+/// The notice for `n` records of `name`'s `.dbf` marked deleted and left out, and for a
+/// Shapefile (`with_shapes`), their shapes with them.
+fn deleted_records_note(name: &str, n: usize, with_shapes: bool) -> Option<String> {
+    deleted_records_text(n, with_shapes).map(|t| format!("{name}: {t}"))
+}
+
+/// [`deleted_records_note`] without the layer's name.
+pub(crate) fn deleted_records_text(n: usize, with_shapes: bool) -> Option<String> {
+    let (what, shapes) = match n {
+        0 => return None,
+        1 => ("1 dBASE record marked deleted was left out".to_string(), ", with its shape"),
+        n => (format!("{n} dBASE records marked deleted were left out"), ", with their shapes"),
+    };
+    Some(if with_shapes { format!("{what}{shapes}") } else { what })
+}
+
 /// Converts one record to typed values, sharing loss counts with the containing dataset.
 fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], counts: &mut DbfCounts) -> Vec<Value> {
     use shapefile::dbase::FieldValue;
-    let DbfCounts { unread_dates, nonfinite, null_text } = counts;
+    let DbfCounts { unread_dates, nonfinite, null_text, .. } = counts;
     fields
         .iter()
         .enumerate()
@@ -3423,35 +4008,48 @@ fn dbf_attrs(record: &shapefile::dbase::Record, fields: &[Field], counts: &mut D
 }
 
 /// Values a `.dbf` read changed, counted for each field by its position: dates that weren't
-/// ones, numbers that weren't finite, and text `<Null>`, all read as null.
+/// ones, numbers that weren't finite, and text `<Null>`, all read as null; and text that wasn't
+/// valid in the table's encoding, counted before the read ([`crate::dbf::not_utf8`]).
 struct DbfCounts {
     unread_dates: Vec<usize>,
     nonfinite: Vec<usize>,
     null_text: Vec<usize>,
+    not_utf8: Vec<usize>,
+    /// The name of the encoding `not_utf8` is of.
+    encoding: &'static str,
 }
 
 impl DbfCounts {
-    fn new(fields: usize) -> Self {
-        DbfCounts { unread_dates: vec![0; fields], nonfinite: vec![0; fields], null_text: Vec::new() }
+    fn new(fields: usize, not_utf8: Vec<usize>, encoding: &'static str) -> Self {
+        DbfCounts { unread_dates: vec![0; fields], nonfinite: vec![0; fields], null_text: Vec::new(), not_utf8, encoding }
     }
 }
 
-/// Reports date, numeric and `<Null>` cells read as null, identically for tables and Shapefiles.
+/// Says the numbers in a `.dbf` that aren't finite (nan or inf), read as empty, with the count for
+/// each field in `counts` (by field index).
+pub(crate) fn nonfinite_note(fields: &[Field], counts: &[usize]) -> Option<crate::loss::Note> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let what = if total == 1 {
+        "1 number isn't finite (nan or inf) and was".to_string()
+    } else {
+        format!("{total} numbers aren't finite (nan or inf) and were")
+    };
+    Some(crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, format!("{what} read as empty, in {}", named_fields(fields, counts))))
+}
+
+/// Reports date, numeric and `<Null>` cells read as null, and text that isn't UTF-8, identically
+/// for tables and Shapefiles.
 fn dbf_notices(ds: &Dataset, report: &mut ReadReport, counts: &DbfCounts) {
-    let DbfCounts { unread_dates, nonfinite, null_text } = counts;
+    let DbfCounts { unread_dates, nonfinite, null_text, not_utf8, encoding } = counts;
     let name = &ds.name;
     report.unread_dates = crate::source::unread_dates_note(&ds.fields, unread_dates);
-    report.messages.extend(report.unread_dates.iter().map(|n| format!("{name}: {n}")));
-    let nonfinite_total: usize = nonfinite.iter().sum();
-    if nonfinite_total > 0 {
-        let what = if nonfinite_total == 1 {
-            "1 number isn't finite (nan or inf) and was".to_string()
-        } else {
-            format!("{nonfinite_total} numbers aren't finite (nan or inf) and were")
-        };
-        report.messages.push(format!("{name}: {what} read as empty, in {}", named_fields(&ds.fields, nonfinite)));
-    }
-    report.messages.extend(crate::source::null_text_note(&ds.fields, null_text).map(|n| format!("{name}: {n}")));
+    report.messages.extend(report.unread_dates.iter().map(|n| n.clone().prefixed(name)));
+    report.messages.extend(nonfinite_note(&ds.fields, nonfinite).map(|n| n.prefixed(name)));
+    report.messages.extend(crate::source::null_text_note(&ds.fields, null_text).map(|n| n.prefixed(name)));
+    report.messages.extend(crate::source::not_utf8_note(&ds.fields, not_utf8, encoding).map(|n| n.prefixed(name)));
 }
 
 /// The files of a Shapefile, read into memory.
@@ -3469,14 +4067,17 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
     use shapefile::Shape;
     use std::io::Cursor;
     let fmt = |e: shapefile::Error| DataError::Format(format!("Shapefile: {e}"));
-    let DbfRead { reader: dbf, fields, decimals, mut report } = dbf_reader(parts.dbf, parts.cpg.as_deref())?;
-    let shapes = match parts.shx {
+    let DbfRead { reader: mut dbf, fields, decimals, mut report, not_utf8, deleted, encoding } =
+        dbf_reader(parts.dbf, parts.cpg.as_deref(), name)?;
+    let mut shapes = match parts.shx {
         Some(shx) => shapefile::ShapeReader::with_shx(Cursor::new(parts.shp), Cursor::new(shx)),
         None => shapefile::ShapeReader::new(Cursor::new(parts.shp)),
     }
     .map_err(fmt)?;
-    let mut reader = shapefile::Reader::new(shapes, dbf);
     let mut ds = Dataset::new(name, GeometryType::None, fields);
+    // A system given or in a `.prj` (even one that can't be used, said on its own) isn't one
+    // RustGIS assumed.
+    let declared = crs.is_some() || parts.prj.is_some();
     let to_lonlat = match crs {
         Some(c) => {
             ds.crs = Some(c);
@@ -3488,12 +4089,61 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
         }),
     };
     let (mut converted, mut unconverted, mut zm_shapes, mut not_numbers) = (0usize, 0usize, 0usize, 0usize);
-    let mut counts = DbfCounts::new(ds.fields.len());
+    // The box of the converted places in longitude/latitude, for the notice of a `.prj` that
+    // doesn't match the coordinates.
+    let mut beyond = 0usize;
+    let mut counts = DbfCounts::new(ds.fields.len(), not_utf8, encoding);
     let mut source_kind = GeometryType::None;
     let pt = |x: f64, y: f64| Coord::new(x, y);
-    for item in reader.iter_shapes_and_records() {
-        let Ok((shape, record)) = item else {
+    // Paired by position: a record marked deleted is read as any other, and left out with its shape.
+    let (mut is_deleted, mut left_out) = (deleted_by_position(&deleted), 0);
+    // Each shape is read with its record, a shape that can't be read too: `shapefile`'s own pairing
+    // returns a shape's error before reading its record, which shifts every later record. Shapes
+    // past the last record, and records past the last shape, are counted.
+    // Without a `.shx`, a shape that can't be read leaves the reader inside it: the shapes after it
+    // can't be found, so the pairing stops there, and the records after it are said.
+    let records = dbf.header().num_records as usize;
+    let indexed = shapes.shape_count().is_ok();
+    let mut lost_extra = false;
+    let (mut shape_iter, mut record_iter) = (shapes.iter_shapes(), dbf.iter_records());
+    let (mut pairs, mut extra_shapes, mut extra_unreadable, mut lost_track) = (0usize, 0usize, 0usize, false);
+    while let Some(shape) = shape_iter.next() {
+        let Some(record) = record_iter.next() else {
+            // Counted, those that can't be read too; without a `.shx` up to the first of those,
+            // past which the file can't be followed.
+            let mut shape = shape;
+            loop {
+                crate::progress::check()?;
+                extra_shapes += 1;
+                if shape.is_err() {
+                    extra_unreadable += 1;
+                    if !indexed {
+                        lost_extra = true;
+                        break;
+                    }
+                }
+                match shape_iter.next() {
+                    Some(next) => shape = next,
+                    None => break,
+                }
+            }
+            break;
+        };
+        let k = pairs;
+        pairs += 1;
+        lost_track = shape.is_err() && !indexed;
+        if is_deleted(k) {
+            left_out += 1;
+            if lost_track {
+                break;
+            }
+            continue;
+        }
+        let (Ok(shape), Ok(record)) = (shape, record) else {
             report.skipped += 1;
+            if lost_track {
+                break;
+            }
             continue;
         };
         zm_shapes += usize::from(!matches!(
@@ -3540,46 +4190,83 @@ pub(crate) fn read_shapefile_parts(parts: ShapefileParts, name: &str, crs: Optio
             }
             g => g,
         };
-        let geom = match (&to_lonlat, geom) {
-            (Some(t), Some(g)) => {
-                let mut ok = true;
-                let out = g.map_coords(&|c| t.to_lonlat(c).unwrap_or(Coord::new(f64::NAN, f64::NAN)));
-                out.for_each_coord(|c| ok &= c.is_finite());
-                converted += usize::from(ok);
-                unconverted += usize::from(!ok);
-                ok.then_some(out)
+        // Kept as the file holds it, in its own system; counted when it has no place in
+        // longitude/latitude.
+        if let (Some(t), Some(g)) = (&to_lonlat, &geom) {
+            let placed = places_lonlat_extent(g, t);
+            if let Some(e) = &placed {
+                beyond += usize::from(e.beyond_lonlat());
             }
-            (_, g) => g,
-        };
+            converted += usize::from(placed.is_some());
+            unconverted += usize::from(placed.is_none());
+        }
         let attrs = dbf_attrs(&record, &ds.fields, &mut counts);
         ds.push_next(geom, attrs);
     }
     ds.drop_zm(&mut report, zm_shapes);
+    report.messages.extend(deleted_records_note(name, left_out, true));
+    if extra_shapes > 0 {
+        let unreadable = match (extra_unreadable, lost_extra) {
+            (0, _) => String::new(),
+            (_, true) => " (the last of them can't be read, and without a .shx the .shp isn't followed past it)".to_string(),
+            (n, false) => format!(" ({n} of them can't be read)"),
+        };
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedFeature,
+            format!("{name}: {extra_shapes} shape(s) past the .dbf's last record have no attributes and were left out{unreadable}"),
+        ));
+    }
+    if lost_track && records > pairs {
+        report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedFeature, format!(
+            "{name}: shape {pairs} can't be read and the Shapefile has no .shx to find the next one by: the {} record(s) after it were left out",
+            records.saturating_sub(pairs)
+        )));
+    } else if records > pairs && extra_shapes == 0 && !lost_track {
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedFeature,
+            format!("{name}: {} dBASE record(s) past the .shp's last shape have no shape and were left out", records - pairs),
+        ));
+    }
     dbf_notices(&ds, &mut report, &counts);
     ds.geometry_type = dominant_type(&ds);
-    // A bad .prj must not turn a spatial layer into an attribute-only table and hide the
-    // conversion warning. Its shapes can be recovered by importing with an override.
-    if ds.geometry_type == GeometryType::None && (unconverted > 0 || not_numbers > 0) {
+    // Shapes whose coordinates aren't numbers must not turn a spatial layer into an
+    // attribute-only table.
+    if ds.geometry_type == GeometryType::None && not_numbers > 0 {
         ds.geometry_type = source_kind;
     }
     integral_numeric_to_integer(&mut ds, &decimals);
-    let e = ds.extent();
-    if !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5) {
-        report.messages.push("coordinates are not longitude/latitude; RustGIS reads them as WGS 84 and they may draw out of place".into());
+    // Held in its own system when it has one RustGIS converts; only coordinates read as
+    // longitude/latitude are checked for being so.
+    if let Some(c) = ds.crs.filter(|_| to_lonlat.is_some()) {
+        ds.held_in = c;
+    }
+    // Beyond longitude/latitude: as the file's shapes come out there from the `.prj`'s system
+    // (one that doesn't match them), counted; or as they are without a system to convert from.
+    match ds.crs.filter(|_| to_lonlat.is_some()) {
+        Some(c) => report.messages.extend(beyond_lonlat_note("shapes", beyond, c)),
+        None if ds.extent().beyond_lonlat() => {
+            let text = "coordinates are not longitude/latitude; RustGIS reads them as WGS 84 and they may draw out of place";
+            report.messages.push(if declared {
+                crate::loss::Note::plain(text)
+            } else {
+                crate::loss::Note::loss(crate::loss::LossCode::AssumedCrs, text)
+            });
+        }
+        None => {}
     }
     if report.skipped > 0 {
-        report.messages.push(format!("{} shapes were unreadable or unsupported", report.skipped));
-    }
-    if not_numbers > 0 {
-        report.messages.push(format!(
-            "{name}: {not_numbers} shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"
+        report.messages.push(crate::loss::Note::loss(
+            crate::loss::LossCode::DroppedFeature,
+            format!("{} shapes were unreadable or unsupported", report.skipped),
         ));
     }
-    ds.crs_incomplete = unconverted > 0;
-    if unconverted > 0 && converted == 0 {
-        report.messages.push("no shape could be converted to longitude/latitude: the .prj doesn't seem to match the coordinates".into());
-    } else if unconverted > 0 {
-        report.messages.push(format!("{unconverted} shapes couldn't be converted to longitude/latitude and have no geometry"));
+    if not_numbers > 0 {
+        report.messages.push(crate::loss::Note::loss(crate::loss::LossCode::DroppedGeometry, format!(
+            "{name}: {not_numbers} shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"
+        )));
+    }
+    if let Some(c) = ds.crs.filter(|_| to_lonlat.is_some()) {
+        report.messages.extend(kept_unplaced_note("shapes", unconverted, converted == 0, c));
     }
     Ok((ds, report))
 }
@@ -3601,7 +4288,10 @@ fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Result<Option<(C
             if let Some(refused) = planetary::refused_wkt(prj, &e) {
                 return Err(DataError::Format(format!("the .prj file: {refused}")));
             }
-            report.messages.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
+            report.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                format!("the .prj file: {e}; coordinates are read as longitude/latitude"),
+            ));
             return Ok(None);
         }
     };
@@ -3611,7 +4301,10 @@ fn shapefile_crs(prj: Option<&str>, report: &mut ReadReport) -> Result<Option<(C
     match crs.transformer() {
         Ok(t) => Ok(Some((crs, t))),
         Err(e) => {
-            report.messages.push(format!("the .prj file: {e}; coordinates are read as longitude/latitude"));
+            report.messages.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                format!("the .prj file: {e}; coordinates are read as longitude/latitude"),
+            ));
             Ok(None)
         }
     }
@@ -4153,6 +4846,12 @@ pub struct CsvLosses {
 impl CsvLosses {
     /// The losses of `features` in a layer of type `gt`; a streamed export adds up its chunks'.
     pub fn of(features: &[crate::Feature], gt: GeometryType, fields: &[Field]) -> Result<Self> {
+        Self::of_placed(features, gt, fields, &|c| Some(c))
+    }
+
+    /// As [`CsvLosses::of`], for features whose points are written where `place` puts them (in
+    /// another system): only the points are converted, not the features.
+    fn of_placed(features: &[crate::Feature], gt: GeometryType, fields: &[Field], place: &dyn Fn(Coord) -> Option<Coord>) -> Result<Self> {
         let mut out = Self { points: gt == GeometryType::Point, guarded: vec![0; fields.len()], ..Self::default() };
         for feature in features {
             crate::progress::check()?;
@@ -4161,7 +4860,7 @@ impl CsvLosses {
             }
             let geometry = feature.geometry.as_ref();
             let point = if out.points { geometry.and_then(Geometry::label_point) } else { None };
-            if out.points && !point.is_some_and(usable_degree_point) {
+            if out.points && !point.and_then(place).is_some_and(usable_degree_point) {
                 out.unusable_points += 1;
             }
             let Some(g) = geometry else { continue };
@@ -4183,10 +4882,12 @@ impl CsvLosses {
     pub fn notes(&self, fields: &[Field], target: &str) -> Vec<String> {
         let mut notes = Vec::new();
         if self.as_one_point > 0 {
-            let what = if self.as_one_point == 1 { "1 feature has".to_string() } else { format!("{} features have", self.as_one_point) };
-            notes.push(format!(
-                "{target}: {what} more than one point (a multipoint, line or polygon) and was written as one, as CSV holds a point a row"
-            ));
+            let what = if self.as_one_point == 1 {
+                "1 feature has more than one point (a multipoint, line or polygon) and was".to_string()
+            } else {
+                format!("{} features have more than one point (a multipoint, line or polygon) and were", self.as_one_point)
+            };
+            notes.push(format!("{target}: {what} written as one, as CSV holds a point a row"));
         }
         if self.unwritten > 0 {
             let what = if self.unwritten == 1 { "1 feature".to_string() } else { format!("{} features", self.unwritten) };
@@ -4211,8 +4912,33 @@ impl CsvLosses {
     /// Warns when adding the CSV back may use attributes for geometry. This can happen when the
     /// coordinate names are all taken or when unusable coordinate rows let a competing pair win.
     pub fn coordinates_note(&self, fields: &[Field], target: &str) -> Option<String> {
+        self.coordinates_note_in(fields, target, Crs::LonLat)
+    }
+
+    /// As [`CsvLosses::coordinates_note`], for a CSV written in `crs`. In a projected system, the
+    /// x and y columns come first and reading takes them first when given the system, unless the
+    /// fields hold every name they could have.
+    pub fn coordinates_note_in(&self, fields: &[Field], target: &str, crs: Crs) -> Option<String> {
         if !self.points {
             return None;
+        }
+        if !crs.is_geographic() {
+            let [x, y] = csv_projected_names(fields);
+            let target: String = target.chars().map(dbf_notice_char).collect();
+            return (x != "x" && x != "easting" || y != "y" && y != "northing").then(|| {
+                // The names that moved the columns: each axis's two, when both are taken.
+                let names: Vec<String> = [(x != "x" && x != "easting", ["x", "easting"]), (y != "y" && y != "northing", ["y", "northing"])]
+                    .into_iter()
+                    .filter(|(moved, _)| *moved)
+                    .flat_map(|(_, names)| names.map(|n| format!("'{n}'")))
+                    .collect();
+                format!(
+                    "{target}: the fields have the names {}, so the coordinates are in columns '{}' and '{}'; pick those columns when adding the file back",
+                    names.join(" and ").replacen(" and ", ", ", names.len().saturating_sub(2)),
+                    dbf_notice_name(&x),
+                    dbf_notice_name(&y)
+                )
+            });
         }
         let header: Vec<String> = csv_coordinate_names(fields).into_iter().chain(fields.iter().map(|f| f.name.clone())).collect();
         let alternative = found_non_geographic_xy(&header);
@@ -4270,20 +4996,375 @@ impl std::ops::AddAssign for CsvLosses {
     }
 }
 
-/// What a CSV, KML, KMZ or GPX file of the whole dataset changes when written to `target`.
-/// A streamed export counts CSV's changes a chunk at a time instead.
+/// What reading a CSV, Shapefile, KML or GPX export back does to its text, counted for each field
+/// over the features the writer writes and reading keeps: spaces around text dropped, blank text
+/// read as null, and features and vertices reading skips. Readers, as they are:
+/// - CSV (and Data Interop's WKT CSV) keeps a cell as it is; an empty one reads as null, and so
+///   does one of spaces in a column read as numbers, and text `<Null>` ([`Value::parse_file`]).
+/// - dBase drops the spaces after text, and reads text of spaces only, or `<Null>`, as null
+///   ([`read_dbf`]).
+/// - KML and GPX trim each value; a blank name reads as null, and a blank KML extended data
+///   value too in a column read as numbers ([`type_text_columns`], for each kind of geometry's
+///   layer). A KML description is kept as it is. KML writes no null value, so a field without one
+///   has no column, which [`export_losses_notes`] says; GPX writes only names, which
+///   [`gpx_notes`] says.
+///
+/// A streamed export adds up its chunks' (`+=`): whether reading takes a column as numbers, which
+/// decides what its blanks become, is settled over all of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextLosses {
+    /// For each layer reading gives (KML: points, lines, polygons; the others: one), each field's,
+    /// in the layer's order.
+    layers: Vec<Vec<FieldText>>,
+    /// Only the spaces after text are dropped (dBase).
+    ends_only: bool,
+    /// Features written that reading skips (KML, GPX): no coordinate in longitude/latitude, or
+    /// too few for their shape.
+    unread: usize,
+    /// Vertices of the features reading keeps (KML, GPX) that don't read back with them
+    /// ([`crate::kml::lost_vertices`], [`crate::gpx::lost_vertices`]).
+    vertices: usize,
+}
+
+/// One field's [`TextLosses`] in one layer read back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FieldText {
+    /// Text with spaces around it that reading drops, unless its column reads as numbers (the
+    /// text is then a number, and read as one).
+    padded: usize,
+    /// Text with spaces around it in a KML or GPX name, which reading trims whatever its
+    /// extended data column's type.
+    name_padded: usize,
+    /// dBase text with a NUL in what the file keeps: reading keeps only the text before it, and
+    /// reads it as null when that is blank (#2415).
+    nul: usize,
+    /// CSV text starting with an apostrophe before a formula's first character (`'=x`), which
+    /// reading takes for the formula guard and drops ([`unguard`], #2415).
+    apostrophe: usize,
+    /// Blank text, read as null.
+    blank: usize,
+    /// Text `<Null>` ([`Value::is_null_marker`]), which CSV and dBase read as null.
+    markers: usize,
+    /// Blank text read as null in a column read as numbers, else read as it is.
+    blank_in_numbers: usize,
+    /// Text of spaces only: read as null in a column read as numbers, else as empty text.
+    spaces: usize,
+    /// The column's written text, when reading types the column from its values.
+    column: Option<TextColumn>,
+}
+
+/// How reading treats one copy of a field's text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextRead {
+    /// A CSV cell, as it is.
+    Cell,
+    /// A dBase Character column: the spaces after it dropped.
+    Dbf,
+    /// A KML or GPX name: trimmed, a blank one null.
+    Name,
+    /// KML extended data: trimmed, its column typed from its values.
+    Data,
+}
+
+/// Whether a longitude and latitude are in range, which the KML and GPX readers keep.
+pub(crate) fn lon_lat_in_range(x: f64, y: f64) -> bool {
+    (-180.0..=180.0).contains(&x) && (-90.0..=90.0).contains(&y)
+}
+
+impl TextLosses {
+    /// The losses of `features`, with `fields`, in a layer of type `gt` written to a file of
+    /// extension `ext` (lowercase), each KML or GPX feature named from field `name_field`; none
+    /// for another format.
+    ///
+    /// One pass over the features without a check for Cancel: the counts of a pass stopped half
+    /// way would understate the losses, so it can't return early. It formats each value once,
+    /// in memory, which is less than the write it follows (the same formatting, plus the write),
+    /// and a streamed export counts a chunk at a time, looking at Cancel between chunks.
+    pub fn of(features: &[crate::Feature], fields: &[Field], gt: GeometryType, ext: &str, name_field: Option<usize>) -> Self {
+        let (csv, shp, kml, gpx) = (matches!(ext, "csv" | "wkt"), matches!(ext, "shp" | "zip"), matches!(ext, "kml" | "kmz"), ext == "gpx");
+        if !(csv || shp || kml || gpx) {
+            return Self::default();
+        }
+        // How reading treats each field's copies: a KML name field is the placemark's name and,
+        // unless called `name` (whose copy reading leaves out as the same), extended data too.
+        let reads: Vec<Vec<TextRead>> = (fields.iter().enumerate())
+            .map(|(k, f)| {
+                let named = (kml || gpx) && Some(k) == name_field;
+                let mut reads = Vec::new();
+                if named {
+                    reads.push(TextRead::Name);
+                }
+                if csv {
+                    reads.push(TextRead::Cell);
+                } else if shp && matches!(f.ty, FieldType::Text | FieldType::DateTime) {
+                    reads.push(TextRead::Dbf);
+                } else if kml && f.name != "description" && !(named && f.name.eq_ignore_ascii_case("name")) {
+                    // A KML description is text as it is.
+                    reads.push(TextRead::Data);
+                }
+                reads
+            })
+            .collect();
+        let fresh: Vec<FieldText> = reads
+            .iter()
+            .map(|r| FieldText { column: (csv || r.contains(&TextRead::Data)).then(TextColumn::default), ..FieldText::default() })
+            .collect();
+        // KML reads a layer for each kind of geometry, and types each one's columns apart.
+        let mut layers = vec![fresh; if kml { 3 } else { 1 }];
+        let mut unread = 0usize;
+        let mut vertices = 0usize;
+        let layer_of = |g: &Geometry| match g.kind() {
+            _ if !kml => 0,
+            GeometryType::Point => 0,
+            GeometryType::Polyline => 1,
+            _ => 2,
+        };
+        for feature in features {
+            let layer = match &feature.geometry {
+                _ if csv => 0,
+                g if shp && shapefile_keeps(g.as_ref(), gt) => 0,
+                Some(g) if kml && crate::kml::keeps(g) => {
+                    vertices = vertices.saturating_add(crate::kml::lost_vertices(g));
+                    layer_of(g)
+                }
+                Some(g) if gpx && crate::gpx::keeps(g) => {
+                    vertices = vertices.saturating_add(crate::gpx::lost_vertices(g));
+                    layer_of(g)
+                }
+                // Written, and skipped on reading (a GPX empty multipoint isn't written at all, and
+                // is said as left out).
+                Some(g) if kml || (gpx && !matches!(g, Geometry::MultiPoint(v) if v.is_empty())) => {
+                    unread = unread.saturating_add(1);
+                    continue;
+                }
+                _ => continue,
+            };
+            let Some(layer) = layers.get_mut(layer) else { continue };
+            for ((v, loss), reads) in feature.attrs.iter().zip(layer.iter_mut()).zip(&reads) {
+                if v.is_null() {
+                    continue;
+                }
+                // Text absorbs every later value, so a column typed Text needs no more.
+                if let Some(column) = &mut loss.column
+                    && !column.is_text()
+                {
+                    let text = match ext {
+                        "csv" => csv_cell(v),
+                        "wkt" => crate::interop::wkt_csv_text(&v.to_file_text()),
+                        _ => v.to_file_text(),
+                    };
+                    // CSV's `<Null>` reads as null, so it types a column no more than an empty cell.
+                    if !(csv && Value::is_null_marker(&text)) {
+                        column.add(&text);
+                    }
+                }
+                let Value::Text(s) = v else { continue };
+                // A value is counted once, however many copies of it are written (a KML name
+                // field's extended data, a GPX multipoint's waypoints): by its first copy, the
+                // name, whose loss is never less than the extended data's.
+                if let Some(read) = reads.first() {
+                    // dBase keeps only the text before a NUL in the 254 bytes a Character column
+                    // keeps: counted apart, and what's kept then loses its trailing spaces as
+                    // other text does; a blank one, read as null, the NUL's notice says (#2415).
+                    let mut s = s.as_str();
+                    if *read == TextRead::Dbf
+                        && let Some(at) = s.bytes().take(254).position(|b| b == 0)
+                    {
+                        loss.nul += 1;
+                        s = s.get(..at).unwrap_or_default();
+                        if s.trim_end_matches(' ').is_empty() {
+                            continue;
+                        }
+                    }
+                    let trimmed = s.trim();
+                    let count = match read {
+                        TextRead::Cell if s.is_empty() => &mut loss.blank,
+                        TextRead::Cell | TextRead::Dbf if Value::is_null_marker(s) => &mut loss.markers,
+                        TextRead::Cell if s.strip_prefix('\'').is_some_and(|rest| rest.starts_with(FORMULA_START)) => &mut loss.apostrophe,
+                        TextRead::Cell if trimmed.is_empty() => &mut loss.blank_in_numbers,
+                        // A Character column; text cut to 254 bytes is said as cut.
+                        TextRead::Dbf if s.len() <= 254 && s.trim_end_matches(' ').is_empty() => &mut loss.blank,
+                        TextRead::Dbf if s.len() <= 254 && s.ends_with(' ') => &mut loss.padded,
+                        TextRead::Name if trimmed.is_empty() => &mut loss.blank,
+                        TextRead::Name if trimmed.len() < s.len() => &mut loss.name_padded,
+                        TextRead::Data if s.is_empty() => &mut loss.blank_in_numbers,
+                        TextRead::Data if trimmed.is_empty() => &mut loss.spaces,
+                        TextRead::Data if trimmed.len() < s.len() => &mut loss.padded,
+                        _ => continue,
+                    };
+                    *count += 1;
+                }
+            }
+        }
+        Self { layers, ends_only: shp, unread, vertices }
+    }
+
+    /// One notice for each loss of a layer with `fields` written to `target`, with a count and
+    /// the fields; none without loss.
+    pub fn notes(&self, fields: &[Field], target: &str) -> Vec<String> {
+        let numbers = |t: &FieldText| t.column.is_some_and(|c| c.ty() != FieldType::Text);
+        // Each field's count over the layers read back.
+        let counts = |count: &dyn Fn(&FieldText) -> usize| -> Vec<usize> {
+            (0..fields.len()).map(|k| self.layers.iter().filter_map(|l| l.get(k)).map(count).sum()).collect()
+        };
+        let trimmed = counts(&|t| t.name_padded + if numbers(t) { 0 } else { t.padded + t.spaces });
+        let blank = counts(&|t| t.blank + t.markers + if numbers(t) { t.blank_in_numbers + t.spaces } else { 0 });
+        let markers = self.layers.iter().flatten().any(|t| t.markers > 0);
+        let target: String = target.chars().map(dbf_notice_char).collect();
+        let mut notes = Vec::new();
+        let n: usize = trimmed.iter().sum();
+        if n > 0 {
+            let what = match (n, self.ends_only) {
+                (1, true) => "1 text value ends with spaces".to_string(),
+                (1, false) => "1 text value starts or ends with spaces, tabs or line breaks".to_string(),
+                (n, true) => format!("{n} text values end with spaces"),
+                (n, false) => format!("{n} text values start or end with spaces, tabs or line breaks"),
+            };
+            notes.push(format!("{target}: {what}, which reading the file back drops, in {}", named_fields(fields, &trimmed)));
+        }
+        let n: usize = blank.iter().sum();
+        if n > 0 {
+            let what = match (n, markers) {
+                (1, false) => "1 blank text value reads".to_string(),
+                (n, false) => format!("{n} blank text values read"),
+                (1, true) => "1 text value, blank or <Null>, reads".to_string(),
+                (n, true) => format!("{n} text values, blank or <Null>, read"),
+            };
+            notes.push(format!("{target}: {what} back as empty (null), in {}", named_fields(fields, &blank)));
+        }
+        let nul = counts(&|t| t.nul);
+        let n: usize = nul.iter().sum();
+        if n > 0 {
+            let what = if n == 1 { "1 text value holds".to_string() } else { format!("{n} text values hold") };
+            notes.push(format!(
+                "{target}: {what} a NUL character, and reading the file back keeps only the text before it, read as empty (null) when that is blank, in {}",
+                named_fields(fields, &nul)
+            ));
+        }
+        let apostrophe = counts(&|t| t.apostrophe);
+        let n: usize = apostrophe.iter().sum();
+        if n > 0 {
+            let what = if n == 1 { "1 text value starts".to_string() } else { format!("{n} text values start") };
+            notes.push(format!(
+                "{target}: {what} with an apostrophe before =, +, -, @, a tab or a line break, which reading the file back takes for the formula guard and drops, in {}",
+                named_fields(fields, &apostrophe)
+            ));
+        }
+        if self.unread > 0 {
+            let what = if self.unread == 1 { "1 feature is".to_string() } else { format!("{} features are", self.unread) };
+            notes.push(format!(
+                "{target}: {what} written but won't read back: no coordinate is inside longitude/latitude, or too few for the shape"
+            ));
+        }
+        if self.vertices > 0 {
+            let what = if self.vertices == 1 { "1 vertex won't".to_string() } else { format!("{} vertices won't", self.vertices) };
+            notes.push(format!(
+                "{target}: {what} read back with the features kept: outside longitude/latitude, or in a part left with too few to keep"
+            ));
+        }
+        notes
+    }
+}
+
+impl std::ops::AddAssign for TextLosses {
+    /// Adds a chunk's losses, of the same fields.
+    fn add_assign(&mut self, other: Self) {
+        if self.layers.is_empty() {
+            *self = other;
+            return;
+        }
+        self.unread = self.unread.saturating_add(other.unread);
+        self.vertices = self.vertices.saturating_add(other.vertices);
+        for (a, b) in self.layers.iter_mut().zip(other.layers).flat_map(|(a, b)| a.iter_mut().zip(b)) {
+            a.padded += b.padded;
+            a.name_padded += b.name_padded;
+            a.nul += b.nul;
+            a.apostrophe += b.apostrophe;
+            a.blank += b.blank;
+            a.markers += b.markers;
+            a.blank_in_numbers += b.blank_in_numbers;
+            a.spaces += b.spaces;
+            if let (Some(a), Some(b)) = (&mut a.column, b.column) {
+                a.merge(b);
+            }
+        }
+    }
+}
+
+/// What a CSV, Shapefile, KML, KMZ or GPX file (extension `ext`) of the whole dataset `ds`
+/// changes when written to `target`: [`CsvLosses`]' notices, KML's fields without a value,
+/// [`gpx_notes`] with each feature named from `name_field`, and [`TextLosses`]' (a Shapefile's
+/// other values are [`shapefile_values_notes`]). A streamed export counts CSV's changes a chunk
+/// at a time instead.
 pub fn export_losses_notes(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str) -> Result<Vec<String>> {
-    Ok(match ext {
+    export_losses_notes_in(ds, ext, name_field, target, Crs::LonLat)
+}
+
+/// As [`export_losses_notes`], for an export written in `crs`.
+pub fn export_losses_notes_in(ds: &Dataset, ext: &str, name_field: Option<usize>, target: &str, crs: Crs) -> Result<Vec<String>> {
+    let mut notes = match ext {
         "csv" => {
-            let losses = CsvLosses::of(&ds.features, ds.geometry_type, &ds.fields)?;
+            // Of the coordinates the file is written in: longitude/latitude, or another
+            // geographic system's, whose points alone are converted to be checked (no copy of the
+            // layer); a projected system's aren't degrees, so aren't checked as such.
+            let losses = if crs == Crs::LonLat {
+                match ds.in_lonlat() {
+                    Ok(ds) => CsvLosses::of(&ds.features, ds.geometry_type, &ds.fields)?,
+                    // A place that can't be given there (written without its geometry, and said
+                    // by [`unplaced_export_note`]): its points converted one by one, those that
+                    // can't be counted as unusable.
+                    Err(_) => {
+                        let to = ds.lonlat_conversion().map_err(DataError::of_conversion)?;
+                        CsvLosses::of_placed(&ds.features, ds.geometry_type, &ds.fields, &|c| to.point(c))?
+                    }
+                }
+            } else if crs.is_geographic() && crs != ds.coord_crs() {
+                let to = ds.coord_crs().to(crs).map_err(DataError::Format)?;
+                CsvLosses::of_placed(&ds.features, ds.geometry_type, &ds.fields, &|c| to.point(c))?
+            } else {
+                CsvLosses::of(&ds.features, ds.geometry_type, &ds.fields)?
+            };
             let mut notes = losses.notes(&ds.fields, target);
-            notes.extend(losses.coordinates_note(&ds.fields, target));
+            notes.extend(losses.coordinates_note_in(&ds.fields, target, crs));
             notes
         }
-        "kml" | "kmz" => kml_empty_fields_note(ds, target)?.into_iter().collect(),
+        "kml" | "kmz" => kml_empty_fields_note(ds, target)?.into_iter().chain(kml_blank_names_note(ds, target)?).collect(),
         "gpx" => gpx_notes(ds, name_field, target),
         _ => Vec::new(),
-    })
+    };
+    notes.extend(TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, ext, name_field).notes(&ds.fields, target));
+    Ok(notes)
+}
+
+/// KML fields whose name is blank once trimmed, with values in the placemarks written: each is
+/// written as `<Data name="">`, which reading drops, so the column and its values are gone
+/// (#2415). A field with no value written is said by [`kml_empty_fields_note`].
+fn kml_blank_names_note(ds: &Dataset, target: &str) -> Result<Option<String>> {
+    let blank: Vec<usize> = ds.fields.iter().enumerate().filter(|(_, f)| f.name.trim().is_empty()).map(|(k, _)| k).collect();
+    if blank.is_empty() {
+        return Ok(None);
+    }
+    // One pass over the placemarks written, looking at Cancel as [`kml_empty_fields_note`] does.
+    let mut with_value = vec![false; blank.len()];
+    let mut values = 0usize;
+    for f in ds.features.iter().filter(|f| f.geometry.is_some()) {
+        crate::progress::check()?;
+        for (has, k) in with_value.iter_mut().zip(&blank) {
+            if f.attrs.get(*k).is_some_and(|v| !v.is_null()) {
+                *has = true;
+                values += 1;
+            }
+        }
+    }
+    let with_values = with_value.iter().filter(|has| **has).count();
+    Ok((values > 0).then(|| {
+        let target: String = target.chars().map(dbf_notice_char).collect();
+        let fields = if with_values == 1 { "1 field".to_string() } else { format!("{with_values} fields") };
+        let written = if values == 1 { "1 value".to_string() } else { format!("{values} values") };
+        format!(
+            "{target}: {fields} with a blank name, and {written} in them, won't read back: reading KML drops extended data without a name"
+        )
+    }))
 }
 
 /// KML writes ExtendedData only for non-null values of placemarks it writes. Report every
@@ -4451,13 +5532,16 @@ fn shapefile_geometry_losses(g: Option<&Geometry>, gt: GeometryType, drawable: f
 /// What an export to a Shapefile in `crs` says it leaves out of the geometry it writes, one
 /// notice per kind with a count, or none: vertices with a missing (NaN) or infinite coordinate,
 /// and the line parts or polygon rings without enough vertices to draw. Features left out whole
-/// are [`left_out_note`]'s. In another system than longitude/latitude, the export writes the
-/// projected copy and refuses a coordinate that doesn't project to a finite one ([`project`]), so
-/// every vertex it writes is drawable (an infinite latitude in Web Mercator is written at
-/// 85.05°), and only parts too short to draw are left out. `target` names what was written; line
+/// are [`left_out_note`]'s. In another system than the one the layer holds its coordinates in
+/// ([`Dataset::coord_crs`]), the export writes the projected copy and
+/// refuses a coordinate that doesn't project to a finite one ([`project`]), so every vertex it
+/// writes is drawable (an infinite latitude in Web Mercator is written at 85.05°), and only parts
+/// too short to draw are left out. `target` names what was written; line
 /// breaks and other control characters in it show as spaces.
 pub fn shapefile_geometry_notes(ds: &Dataset, target: &str, crs: Crs) -> Vec<String> {
-    let drawable: fn(&Coord) -> bool = if crs == Crs::LonLat { |c| c.x.is_finite() && c.y.is_finite() } else { |_| true };
+    // Written as held when `crs` is the system the layer holds its coordinates in; otherwise a
+    // converted copy, which refused every vertex that isn't a place.
+    let drawable: fn(&Coord) -> bool = if crs == ds.coord_crs() { |c| c.x.is_finite() && c.y.is_finite() } else { |_| true };
     let (mut vertices, mut parts) = (0usize, 0usize);
     for f in &ds.features {
         let Some((v, p)) = shapefile_geometry_losses(f.geometry.as_ref(), ds.geometry_type, drawable) else { continue };
@@ -4763,10 +5847,85 @@ pub(crate) fn group_rings(rings: Vec<(Vec<Coord>, bool)>) -> Geometry {
     Geometry::Polygon(polys)
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A write to a name nothing holds reserves it first: a second write to it is refused before
+    /// anything is written, and dropping the write removes the reservation and the folder made for
+    /// it; once installed, both stay (#2865).
+    #[test]
+    fn a_new_staged_file_reserves_its_name_and_leaves_nothing_when_dropped() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Survey.rgis.data");
+        std::fs::create_dir(&folder).unwrap();
+        let dest = folder.join("index.tif");
+        let (staged, ()) = stage_streamed_new::<_, std::io::Error>(&dest, Some(&folder), |w| w.write_all(b"pixels")).unwrap();
+        assert!(dest.is_file(), "reserved");
+        let taken = stage_streamed_new::<(), std::io::Error>(&dest, None, |_| panic!("written to a name another holds"));
+        assert_eq!(taken.err().map(|e| e.kind()), Some(std::io::ErrorKind::AlreadyExists));
+        drop(staged);
+        assert!(!dest.exists() && !folder.exists(), "the reservation and its folder go with it");
+        std::fs::create_dir(&folder).unwrap();
+        let (staged, ()) = stage_streamed_new::<_, std::io::Error>(&dest, Some(&folder), |w| w.write_all(b"pixels")).unwrap();
+        staged.commit().unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"pixels");
+    }
+
+    /// Each extra cell is counted, including empty ones, and each affected row once, preserving named data.
+    #[test]
+    fn csv_extra_cells_are_counted() {
+        for (text, expected) in [
+            ("wkt,id,note\nPOINT(1 2),7,kept\nPOINT(3 4),8,\n", vec![]),
+            (
+                "wkt,id,note\nPOINT(1 2),7,kept,lost,\nPOINT(3 4),8,,tail\n",
+                vec!["3 cells past the header's 3 columns were omitted in 2 rows"],
+            ),
+            ("wkt,id,note\nPOINT(1 2),7,kept,\nPOINT(3 4),8,\n", vec!["1 cell past the header's 3 columns was omitted in 1 row"]),
+        ] {
+            let (ds, report) = read_csv(text, "extra").unwrap();
+            assert_eq!(ds.fields, [Field::new("id", FieldType::Integer), Field::new("note", FieldType::Text)]);
+            assert_eq!(ds.features.len(), 2);
+            assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))));
+            assert_eq!(ds.features[1].geometry, Some(Geometry::Point(Coord::new(3.0, 4.0))));
+            assert_eq!(ds.features[0].attrs, [Value::Int(7), Value::Text("kept".into())]);
+            assert_eq!(ds.features[1].attrs, [Value::Int(8), Value::Null]);
+            assert_eq!(report.skipped, 0);
+            assert_eq!(report.messages.texts().collect::<Vec<_>>(), expected);
+            assert!(report.messages.iter().all(|m| m.loss == Some(crate::loss::LossCode::DroppedExtraAttributes)));
+        }
+    }
+
+    /// A file refused because RustGIS holds much of the memory says so, with the limit when nothing
+    /// is held and what to do; refused at the full limit, or where the limit doesn't follow the
+    /// memory, it says what it said before (#2431).
+    #[test]
+    fn a_file_refused_while_memory_is_held_says_so() {
+        const GIB: u64 = 1 << 30;
+        if bytes_ceiling() == BYTES_FLOOR {
+            return; // A phone or a 32-bit build: the limit doesn't follow the memory.
+        }
+        let lowered = too_large_held(2 * GIB, GIB, Some(64 * GIB), 40 * GIB, None);
+        assert_eq!(
+            lowered,
+            "file is too large (2048 MiB; the most read into memory is 1024 MiB on this computer now, with RustGIS holding 40960 MiB, 2048 MiB otherwise): free memory by removing layers or tables you no longer need (save and reopen the project to let go of what Undo keeps of them) or closing other programs, then try again"
+        );
+        let busy = too_large_held(GIB, 512 << 20, Some(64 * GIB), GIB, Some(5 * GIB));
+        assert!(busy.contains("with RustGIS holding 1024 MiB and 5120 MiB free, 2048 MiB otherwise"), "{busy}");
+        let full = too_large_held(3 * GIB, 2 * GIB, Some(64 * GIB), GIB, Some(60 * GIB));
+        assert_eq!(
+            full,
+            "file is too large (3072 MiB; the most read into memory is 2048 MiB on this computer, a limit that follows its memory)"
+        );
+        assert_eq!(too_large_held(3 * GIB, 2 * GIB, Some(64 * GIB), 0, None), full);
+        assert_eq!(
+            too_large_held(GIB, 256 << 20, None, 40 * GIB, None),
+            "file is too large (1024 MiB; the most read into memory is 256 MiB)"
+        );
+    }
 
     /// The size read into memory follows the computer's memory between its floor and ceiling,
     /// and stays at the floor where the memory isn't known (the browser) (#2408).
@@ -4785,17 +5944,23 @@ mod tests {
             assert_eq!(max_bytes_for(Some(16 * GIB)), BYTES_FLOOR);
             assert_eq!(max_bytes_for(Some(1024 * GIB)), BYTES_FLOOR);
         }
-        // The test limit is the calling thread's, and comes back after it, nested too.
-        let real = max_bytes();
+        // Holding more than half the memory lowers it, never below the floor (#2431).
+        if bytes_ceiling() > BYTES_FLOOR {
+            assert_eq!(max_bytes_within(crate::memory::share(Some(16 * GIB), 8 * GIB, None)), 512 << 20, "half held: unchanged");
+            assert_eq!(max_bytes_within(crate::memory::share(Some(64 * GIB), 40 * GIB, None)), GIB);
+            assert_eq!(max_bytes_within(crate::memory::share(Some(16 * GIB), 12 * GIB, None)), BYTES_FLOOR);
+        }
+        // The test limit is the calling thread's, and comes back after it, nested too. The real one
+        // follows what is free now (#2431), so it is only compared with its floor.
         with_max_bytes(10, || {
             assert_eq!(max_bytes(), 10);
             with_max_bytes(20, || assert_eq!(max_bytes(), 20));
             assert_eq!(max_bytes(), 10);
-            assert_eq!(std::thread::spawn(max_bytes).join().unwrap(), real);
+            assert!(std::thread::spawn(max_bytes).join().unwrap() >= BYTES_FLOOR);
         });
-        assert_eq!(max_bytes(), real);
-        let said = too_large(3 << 20);
-        assert!(said.starts_with("file is too large (3 MiB;") && said.contains(&format!("{} MiB", real >> 20)), "{said}");
+        assert!(max_bytes() >= BYTES_FLOOR);
+        let said = with_max_bytes(1 << 20, || too_large(3 << 20));
+        assert!(said.starts_with("file is too large (3 MiB;") && said.contains("is 1 MiB"), "{said}");
     }
 
     /// A file past the limit is refused before it is parsed, by each reader that takes it whole,
@@ -4915,6 +6080,73 @@ mod tests {
         let mut areas = mixed.clone();
         areas.features.truncate(1);
         assert_eq!(write_path(&areas, &dir.path().join("areas.shp"))?, 0);
+        Ok(())
+    }
+
+    /// Placing a Shapefile's parts: old parts whose copies can't be removed once the new ones land
+    /// are returned and said; a clean placement leaves and says nothing; a placement rolled back
+    /// whole names the file and says nothing changed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn placing_a_shapefile_says_old_parts_it_keeps_and_a_rollback() -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let dir = tempfile::tempdir()?;
+        let shp = dir.path().join("parcels.shp");
+        let dbf = dir.path().join("parcels.dbf");
+        let entries = || -> std::io::Result<usize> { Ok(std::fs::read_dir(dir.path())?.count()) };
+        std::fs::write(&shp, b"old shp")?;
+        std::fs::write(&dbf, b"old dbf")?;
+        let parts = |tag: &str| vec![(shp.clone(), format!("{tag} shp").into_bytes()), (dbf.clone(), format!("{tag} dbf").into_bytes())];
+
+        KEEP_BACKUPS.set(true);
+        let kept = place_shapefile(&shp, &stage_shapefile(&parts("new"))?);
+        KEEP_BACKUPS.set(false);
+        let kept = kept?;
+        assert_eq!(std::fs::read(&shp)?, b"new shp");
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|k| k.exists()));
+        let note = kept_backups_note(&shp, &kept).unwrap_or_default();
+        assert!(note.contains("2 old part(s) couldn't be removed") && note.contains("can be deleted"), "{note}");
+        assert!(kept.iter().all(|k| note.contains(&k.display().to_string())), "{note}");
+        for k in &kept {
+            std::fs::remove_file(k)?;
+        }
+
+        // Clean: nothing kept, nothing said, nothing left beside the file.
+        let kept = place_shapefile(&shp, &stage_shapefile(&parts("newer"))?)?;
+        assert!(kept.is_empty() && kept_backups_note(&shp, &kept).is_none());
+        assert_eq!(entries()?, 2);
+
+        // A part that fails to land (its staged copy gone): every old part is put back.
+        let staged = stage_shapefile(&parts("newest"))?;
+        let (gone, _) = staged.iter().find(|(_, target)| *target == dbf).ok_or("no staged .dbf")?;
+        std::fs::remove_file(gone)?;
+        let error = place_shapefile(&shp, &staged).err().ok_or("placed")?.to_string();
+        assert!(
+            error.contains(&format!("{}: ", shp.display())) && error.ends_with("the old file was put back, nothing changed"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&shp)?, b"newer shp");
+        assert_eq!(std::fs::read(&dbf)?, b"newer dbf");
+        assert_eq!(entries()?, 2);
+
+        // A new file that fails to land had nothing to put back, and says so.
+        let fresh = dir.path().join("fresh.shp");
+        let parts = vec![(fresh.clone(), b"shp".to_vec()), (fresh.with_extension("dbf"), b"dbf".to_vec())];
+        let staged = stage_shapefile(&parts)?;
+        let (gone, _) = staged.iter().find(|(_, target)| *target == fresh).ok_or("no staged .shp")?;
+        std::fs::remove_file(gone)?;
+        let error = place_shapefile(&fresh, &staged).err().ok_or("placed")?.to_string();
+        assert!(error.ends_with("nothing was written") && !error.contains("put back"), "{error}");
+        assert_eq!(entries()?, 2);
+
+        // An export over the file says the old parts it keeps.
+        let mut ds = Dataset::new("parcels", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![]);
+        KEEP_BACKUPS.set(true);
+        let written = write_path_to(&ds, &shp, Crs::LonLat, &GpkgTable::default());
+        KEEP_BACKUPS.set(false);
+        let (_, _, notes) = written?;
+        assert!(notes.len() == 1 && notes.iter().all(|n| n.contains("couldn't be removed")), "{notes:?}");
         Ok(())
     }
 
@@ -5400,7 +6632,8 @@ mod tests {
                 let (ds, report) = read_geojson(&root.to_string(), "collection").unwrap();
                 assert!(ds.features.is_empty(), "must not retain a partial collection: {root}");
                 assert_eq!(report.skipped, 1);
-                assert_eq!(report.messages, ["1 features had unreadable geometry"]);
+                assert_eq!(report.messages.texts().collect::<Vec<_>>(), ["1 features had unreadable geometry"]);
+                assert_eq!(report.messages[0].loss, Some(crate::loss::LossCode::DroppedFeature));
                 assert!(to_geojson(&ds)["features"].as_array().unwrap().is_empty());
             }
         }
@@ -5481,9 +6714,12 @@ mod tests {
             CsvOptions { x: Some("e".into()), y: Some("N".into()), crs: Some(Crs::parse("EPSG:2263").unwrap()), ..CsvOptions::default() };
         let (ds, rep) = read_csv_with(text, "t", &opts).unwrap();
         assert_eq!(ds.geometry_type, GeometryType::Point);
+        // Held in the file's system; placed in longitude/latitude.
+        assert_eq!(ds.held_in, Crs::parse("EPSG:2263").unwrap());
+        let ds = ds.in_lonlat().unwrap().into_owned();
         let Some(Geometry::Point(c)) = &ds.features[0].geometry else { panic!() };
         assert!((c.x + 73.96).abs() < 0.05 && (c.y - 40.78).abs() < 0.05, "{c:?}");
-        assert_eq!(rep.messages, ["1 rows had no usable coordinates"]);
+        assert_eq!(rep.messages.texts().collect::<Vec<_>>(), ["1 rows had no usable coordinates"]);
         // Without the coordinate system, the points are said to be out of place.
         let (_, rep) = read_csv_with(text, "t", &CsvOptions { crs: None, ..opts.clone() }).unwrap();
         assert!(rep.messages.iter().any(|m| m.contains("\"crs\"")), "{:?}", rep.messages);
@@ -5501,15 +6737,15 @@ mod tests {
         let (ds, rep) = read_csv(text, "t").unwrap();
         assert_eq!(ds.geometry_type, GeometryType::Polyline);
         assert_eq!(ds.fields.len(), 1);
-        let e = ds.features[0].geometry.as_ref().unwrap().extent();
+        let e = ds.in_lonlat().unwrap().features[0].geometry.as_ref().unwrap().extent();
         assert!((e.min_x - 15.0).abs() < 0.01 && (e.min_y - 42.0).abs() < 0.05, "{e:?}");
         assert!(ds.features[3].geometry.is_none());
         assert_eq!(
             rep.messages,
             [
-                crate::zm_note(Some(1)).as_str(),
-                "1 rows had geometry that isn't readable WKT",
-                "1 rows have another kind of geometry than the layer's polyline"
+                crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(Some(1))),
+                crate::loss::Note::loss(crate::loss::LossCode::DroppedGeometry, "1 rows had geometry that isn't readable WKT"),
+                "1 rows have another kind of geometry than the layer's polyline".into()
             ]
         );
         // A named WKT column with a given system.
@@ -5518,6 +6754,53 @@ mod tests {
             read_csv_with("g|v\nPOLYGON ((0 0, 1000 0, 1000 1000, 0 0))|1\n", "t", &CsvOptions { delimiter: Some(b'|'), ..opts }).unwrap();
         assert_eq!(ds.geometry_type, GeometryType::Polygon);
         assert_eq!(ds.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["v"]);
+    }
+
+    /// Counts affected input values once, even when loss happens at several nesting levels.
+    #[test]
+    fn wkt_collection_losses_are_said_without_changing_retained_data() {
+        let values = [
+            "GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4),POINT(5 6))",
+            "GEOMETRYCOLLECTION(GEOMETRYCOLLECTION(POINT(1 2),POINT(3 4)),POINT(5 6))",
+            "GEOMETRYCOLLECTION(POINT EMPTY,GEOMETRYCOLLECTION(POINT(1 2),POINT EMPTY))",
+            "GEOMETRYCOLLECTION EMPTY",
+            "GEOMETRYCOLLECTION(POINT EMPTY,GEOMETRYCOLLECTION EMPTY)",
+            "GEOMETRYCOLLECTION(POINT(1 2))",
+        ];
+        let mut csv = String::from("wkt,id\n");
+        for (i, value) in values.iter().enumerate() {
+            csv.push_str(&format!("\"SRID=4326;{value}\",{i}\n"));
+        }
+        let (ds, report) = read_csv(&csv, "collections").unwrap();
+        assert_eq!(report.skipped, 0);
+        assert_eq!(
+            report.messages.texts().collect::<Vec<_>>(),
+            ["2 WKT values in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"]
+        );
+        assert_eq!(ds.held_in, crate::raster::Crs::LonLat);
+        assert!(!ds.zm_dropped);
+        for (i, row) in ds.features.iter().enumerate() {
+            assert_eq!(row.attrs, [Value::Int(i as i64)]);
+            assert_eq!(row.geometry, if matches!(i, 3 | 4) { None } else { Some(Geometry::Point(Coord::new(1.0, 2.0))) });
+        }
+        for value in &values[2..] {
+            let (_, report) = read_csv(&format!("wkt,id\n\"{value}\",7\n"), "clean").unwrap();
+            assert!(report.messages.is_empty(), "{value}: {report:?}");
+        }
+        let (ds, report) = read_csv("wkt,id\n\"SRID=4326;GEOMETRYCOLLECTION(POINT M(1 2 3),POINT Z(3 4 5))\",7\n", "dimensions").unwrap();
+        assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))));
+        assert_eq!(ds.features[0].attrs, [Value::Int(7)]);
+        assert!(ds.zm_dropped);
+        assert_eq!(
+            report.messages,
+            [
+                crate::loss::Note::loss(crate::loss::LossCode::DroppedZm, crate::zm_note(Some(1))),
+                crate::loss::Note::loss(
+                    crate::loss::LossCode::DroppedGeometry,
+                    "1 WKT value in 'wkt' lost later non-empty geometry-collection members; only the first non-empty member is kept"
+                )
+            ]
+        );
     }
 
     /// Z and M values RustGIS doesn't keep are said when read, whole or in place, and the mark
@@ -5541,7 +6824,7 @@ mod tests {
         };
         let (wells, flat) = (shp("wells.shp", true), shp("flat.shp", false));
         let (ds, rep) = read_path(&wells).unwrap();
-        assert!(ds.zm_dropped && rep.messages.contains(&crate::zm_note(Some(1))), "{:?}", rep.messages);
+        assert!(ds.zm_dropped && rep.messages.says(&crate::zm_note(Some(1))), "{:?}", rep.messages);
         assert_eq!(ds.features[0].geometry, Some(Geometry::Point(Coord::new(1.0, 2.0))));
         let (ds, rep) = read_path(&flat).unwrap();
         assert!(!ds.zm_dropped && !said(&rep));
@@ -5602,7 +6885,7 @@ mod tests {
         let (ds, rep) = read_geojson(mixed, "mixed").unwrap();
         assert!(ds.features.is_empty() && !ds.zm_dropped && !said(&rep));
         assert_eq!(rep.skipped, 1);
-        assert_eq!(rep.messages, ["1 features had unreadable geometry"]);
+        assert_eq!(rep.messages.texts().collect::<Vec<_>>(), ["1 features had unreadable geometry"]);
         let curve = r#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{},"geometry":{"type":"Curve","coordinates":[[1,2,3]]}},{"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}}]}"#;
         let (ds, rep) = read_geojson(curve, "curve").unwrap();
         assert!(!ds.zm_dropped && !said(&rep) && rep.skipped == 1, "{rep:?}");
@@ -5631,8 +6914,11 @@ mod tests {
         other.name = "wells".into();
         let flat = Dataset::new("roads", GeometryType::Polyline, vec![]);
         assert_eq!(
-            crate::zm_export_note([&ds, &flat, &other], "site.zip").as_deref(),
-            Some("site.zip: its geometry has no Z or M values for 2 layers (pts, wells), which were dropped when they were read")
+            crate::zm_export_note([&ds, &flat, &other], "site.zip"),
+            Some(crate::loss::Note::loss(
+                crate::loss::LossCode::DroppedZm,
+                "site.zip: its geometry has no Z or M values for 2 layers (pts, wells), which were dropped when they were read"
+            ))
         );
         assert_eq!(crate::zm_export_note([&flat], "roads.zip"), None);
 
@@ -5655,6 +6941,7 @@ mod tests {
         assert!(rep.messages.is_empty(), "{:?}", rep.messages);
         assert_eq!(
             crate::export_notes([(&utm, ext(&utm)), (&lonlat, ext(&lonlat))], "out.geojson", Crs::LonLat),
+            // Told by the extent alone: said without a code.
             [
                 "out.geojson: the coordinates of utm aren't longitude/latitude, so they're out of place: define its projection and export again"
             ]
@@ -5673,9 +6960,12 @@ mod tests {
         let saved: Dataset = serde_json::from_value(serde_json::to_value(&parcels).unwrap()).unwrap();
         assert_eq!(
             crate::export_notes([(&saved, ext(&saved))], "parcels.geojson", Crs::LonLat),
-            [format!(
-                "parcels.geojson: the positions of parcels are approximate, possibly a few hundred metres off: its coordinate system ({}) has no shift to WGS 84",
-                nad27.label()
+            [crate::loss::Note::loss(
+                crate::loss::LossCode::ApproximatedDatum,
+                format!(
+                    "parcels.geojson: the positions of parcels are approximate, possibly a few hundred metres off: its coordinate system ({}) has no shift to WGS 84",
+                    nad27.label()
+                )
             )]
         );
         // Written back in NAD 27, the positions come back as they were read.
@@ -5687,9 +6977,10 @@ mod tests {
         shifted.crs = Some(Crs::Epsg(26716));
         assert_eq!(
             crate::export_notes([&parcels, &roads, &shifted].map(|ds| (ds, ext(ds))), "map.json", Crs::LonLat),
-            [
+            [crate::loss::Note::loss(
+                crate::loss::LossCode::ApproximatedDatum,
                 "map.json: the positions of 2 layers (parcels, roads) are approximate, possibly a few hundred metres off: their coordinate systems have no shift to WGS 84"
-            ]
+            )]
         );
     }
 
@@ -5726,7 +7017,10 @@ mod tests {
         assert_eq!(merc.features[0].geometry, Some(Geometry::Point(lonlat_to_merc(c(10.0, MAX_LAT)))));
         assert_eq!(
             crate::export_notes([(&polar, ext(&polar))], "polar.shp", Crs::WebMercator),
-            ["polar.shp: 3 vertices of polar are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"]
+            [crate::loss::Note::loss(
+                crate::loss::LossCode::ChangedPosition,
+                "polar.shp: 3 vertices of polar are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"
+            )]
         );
         // In another system, or within 85.05°: nothing.
         for crs in [Crs::LonLat, Crs::Epsg(32631)] {
@@ -5738,13 +7032,17 @@ mod tests {
         let one = layer("one", &[c(0.0, 86.0)]);
         assert_eq!(
             crate::export_notes([(&one, ext(&one))], "one.gpkg", Crs::WebMercator),
-            ["one.gpkg: 1 vertex of one is beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"]
+            [crate::loss::Note::loss(
+                crate::loss::LossCode::ChangedPosition,
+                "one.gpkg: 1 vertex of one is beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"
+            )]
         );
         assert_eq!(
             crate::export_notes([(&polar, ext(&polar)), (&within, ext(&within)), (&one, ext(&one))], "map.gpkg", Crs::WebMercator),
-            [
+            [crate::loss::Note::loss(
+                crate::loss::LossCode::ChangedPosition,
                 "map.gpkg: 4 vertices of 2 layers (polar, one) are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"
-            ]
+            )]
         );
         // A streamed layer's features are only those in view: its source's extent tells, without
         // a count, and only that it reaches beyond, as a source can declare a wider one than its
@@ -5761,9 +7059,10 @@ mod tests {
         // A layer counted and a window told by its extent: one notice, saying both.
         assert_eq!(
             crate::export_notes([(&polar, ext(&polar)), (&window, Extent::new(-180.0, -90.0, 180.0, 84.0))], "map.gpkg", Crs::WebMercator),
-            [
+            [crate::loss::Note::loss(
+                crate::loss::LossCode::ChangedPosition,
                 "map.gpkg: 3 vertices of polar are beyond 85.05° north or south, and written at 85.05°; the extent of tiles reaches beyond 85.05° north or south, and what lies beyond is written at 85.05°, where Web Mercator ends"
-            ]
+            )]
         );
         // A layer without features that isn't a window (a raster layer's, or a streamed layer's
         // written a chunk at a time, whose export counts as it writes) has no extent tell.
@@ -5802,8 +7101,11 @@ mod tests {
             {
                 assert_eq!(
                     crate::export_notes([(ds, ext(ds))], &target, Crs::WebMercator),
-                    [format!(
-                        "{target}: {n} vertices of {name} are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"
+                    [crate::loss::Note::loss(
+                        crate::loss::LossCode::ChangedPosition,
+                        format!(
+                            "{target}: {n} vertices of {name} are beyond 85.05° north or south, and written at 85.05°, where Web Mercator ends"
+                        )
                     )]
                 );
             }
@@ -5811,6 +7113,7 @@ mod tests {
             let (zip, _) = write_bytes_in(ds, "shp", Crs::WebMercator).unwrap();
             let mut at_edge = 0;
             for (back, _) in read_zip(&format!("{name}.zip"), &zip).unwrap() {
+                let back = back.in_lonlat().unwrap();
                 for g in back.features.iter().filter_map(|f| f.geometry.as_ref()) {
                     g.for_each_coord(|c| at_edge += usize::from((c.y.abs() - MAX_LAT).abs() < 1e-6));
                 }
@@ -5952,7 +7255,7 @@ mod tests {
         let text = "X,Y,Longitude,Latitude\n1000,2000,-89.9,35.1\n";
         let opts = CsvOptions { crs: Some(Crs::WebMercator), ..Default::default() };
         let (ds, report) = read_csv_with(text, "projected", &opts).unwrap();
-        let Some(Geometry::Point(p)) = ds.features[0].geometry else { panic!("point") };
+        let Some(Geometry::Point(p)) = ds.in_lonlat().unwrap().features[0].geometry else { panic!("point") };
         assert!((p.x - 0.00898315).abs() < 1e-7 && (p.y - 0.0179663).abs() < 1e-7);
         assert!(report.messages.is_empty());
         for crs in [Crs::WebMercator, Crs::parse("EPSG:2263").unwrap(), Crs::parse("+proj=merc +datum=WGS84 +units=m").unwrap()] {
@@ -6140,13 +7443,13 @@ mod tests {
                 assert_eq!((columns.x.as_deref(), columns.y.as_deref()), (Some(x), Some(y)));
                 let opts = CsvOptions { crs: Some(Crs::WebMercator), ..Default::default() };
                 let (dataset, report) = read_csv_with(&text, "projected", &opts).unwrap();
-                let Some(Geometry::Point(point)) = dataset.features[0].geometry else { panic!("point") };
+                let Some(Geometry::Point(point)) = dataset.in_lonlat().unwrap().features[0].geometry else { panic!("point") };
                 assert!((point.x - 1.0).abs() < 1e-10 && (point.y - 2.0).abs() < 1e-10, "{point:?}");
                 assert_eq!(report.skipped, 0);
                 assert!(report.messages.is_empty(), "{:?}", report.messages);
                 let opts = CsvOptions { x: Some("Longitude".into()), y: Some("Latitude".into()), ..opts };
                 let (explicit, _) = read_csv_with(&text, "explicit", &opts).unwrap();
-                let Some(Geometry::Point(point)) = explicit.features[0].geometry else { panic!("point") };
+                let Some(Geometry::Point(point)) = explicit.in_lonlat().unwrap().features[0].geometry else { panic!("point") };
                 assert!(point.x.abs() < 0.001 && point.y.abs() < 0.001, "explicit selection must win: {point:?}");
             }
         }
@@ -6310,6 +7613,423 @@ mod tests {
         ds.push(None, vec![]);
         assert_eq!(gpx_left_out(&ds), 2);
         assert_eq!(write_bytes(&ds, "gpx").unwrap().1, 2);
+    }
+
+    /// A text layer for [`TextLosses`]: point features with `rows` of text values, and one without
+    /// geometry holding blanks and padded text, which KML, GPX and Shapefile don't write.
+    fn text_layer(names: &[&str], rows: &[&[Option<&str>]]) -> Dataset {
+        let fields = names.iter().map(|n| Field::new(*n, FieldType::Text)).collect();
+        let mut ds = Dataset::new("t", GeometryType::Point, fields);
+        for (i, row) in rows.iter().enumerate() {
+            let attrs = row.iter().map(|v| v.map_or(Value::Null, |t| Value::Text(t.to_string()))).collect();
+            ds.push(Some(Geometry::Point(Coord::new(i as f64, 1.0))), attrs);
+        }
+        ds.push(None, names.iter().map(|_| Value::Text(" ".into())).collect());
+        ds
+    }
+
+    fn text_notes(ds: &Dataset, ext: &str) -> Vec<String> {
+        TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, ext, name_field(ds)).notes(&ds.fields, "t")
+    }
+
+    #[test]
+    fn csv_says_blank_text_that_reads_as_null() {
+        // 'code' reads as numbers, so its blank of spaces reads as null; 'note' stays text, which
+        // keeps spaces.
+        let ds = text_layer(&["note", "code"], &[&[Some(""), Some("1")], &[Some("  "), Some(" ")], &[Some(" x "), Some("")]]);
+        // The feature without geometry is a CSV row: its blank in 'code' counts too.
+        assert_eq!(text_notes(&ds, "csv"), ["t: 4 blank text values read back as empty (null), in 'note', 'code'"]);
+        assert_eq!(text_notes(&ds, "wkt"), ["t: 4 blank text values read back as empty (null), in 'note', 'code'"]);
+        let mut clean = text_layer(&["note", "code"], &[&[Some(" x "), Some("1")], &[Some("  "), None]]);
+        // Without the row of spaces, which 'code' reads as null.
+        clean.features.truncate(2);
+        assert!(text_notes(&clean, "csv").is_empty());
+    }
+
+    #[test]
+    fn shapefile_says_trailing_spaces_and_blank_text() {
+        let ds = text_layer(&["a", "b"], &[&[Some("lead "), Some(" kept")], &[Some("   "), Some("")], &[None, Some("x  ")]]);
+        assert_eq!(
+            text_notes(&ds, "shp"),
+            [
+                "t: 2 text values end with spaces, which reading the file back drops, in 'a', 'b'",
+                "t: 2 blank text values read back as empty (null), in 'a', 'b'",
+            ]
+        );
+        assert_eq!(text_notes(&ds, "zip"), text_notes(&ds, "shp"));
+        let clean = text_layer(&["a"], &[&[Some(" kept")], &[None]]);
+        assert!(text_notes(&clean, "shp").is_empty());
+    }
+
+    /// Shapefile text with a NUL in it is said: reading the `.dbf` back keeps only the text before
+    /// it, and reads a value starting with one as null (#2415).
+    #[test]
+    fn shapefile_says_text_cut_at_a_nul() {
+        // The text before a NUL loses its trailing spaces as other text does ('ab '), and blank
+        // text before one (' ') reads as null, which the NUL's notice says.
+        let ds = text_layer(&["a", "b"], &[&[Some("ab\0cd"), Some("kept")], &[Some("\0x"), None], &[Some("ab \0cd"), Some(" \0y")]]);
+        assert_eq!(
+            text_notes(&ds, "shp"),
+            [
+                "t: 1 text value ends with spaces, which reading the file back drops, in 'a'",
+                "t: 4 text values hold a NUL character, and reading the file back keeps only the text before it, read as empty (null) when that is blank, in 'a', 'b'",
+            ]
+        );
+        // What the note says is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "zip").unwrap();
+        let back = read_bytes("t.zip", &bytes).unwrap().0;
+        let column = |k: usize| back.features.iter().take(3).map(|f| f.attrs[k].clone()).collect::<Vec<_>>();
+        assert_eq!(column(0), [Value::Text("ab".into()), Value::Null, Value::Text("ab".into())]);
+        assert_eq!(column(1), [Value::Text("kept".into()), Value::Null, Value::Null]);
+        let clean = text_layer(&["a"], &[&[Some("abcd")], &[None]]);
+        assert!(text_notes(&clean, "shp").is_empty());
+    }
+
+    /// CSV text starting with an apostrophe before a formula's first character is said: reading
+    /// the file back takes the apostrophe for the formula guard and drops it (#2415). Text the
+    /// writer guards (`=y`) reads back as it was, and says nothing.
+    #[test]
+    fn csv_says_an_apostrophe_reading_takes_for_the_guard() {
+        let ds = text_layer(&["note", "code"], &[&[Some("'=x"), Some("a")], &[Some("'kept"), Some("'-5")], &[Some("=y"), Some("b")]]);
+        let said = "t: 2 text values start with an apostrophe before =, +, -, @, a tab or a line break, which reading the file back takes for the formula guard and drops, in 'note', 'code'";
+        assert_eq!(text_notes(&ds, "csv"), [said]);
+        assert_eq!(text_notes(&ds, "wkt"), [said]);
+        // What the note says is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "csv").unwrap();
+        let back = read_bytes("t.csv", &bytes).unwrap().0;
+        let column = |n: &str| {
+            let i = back.field_index(n).unwrap();
+            back.features.iter().take(3).map(|f| f.attrs[i].to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(column("note"), ["=x", "'kept", "=y"]);
+        assert_eq!(column("code"), ["a", "-5", "b"]);
+        let clean = text_layer(&["note"], &[&[Some("'kept")], &[Some("=y")], &[Some("it's")]]);
+        assert!(text_notes(&clean, "csv").is_empty());
+    }
+
+    /// A KML field whose name is blank is said with its values: it's written as
+    /// `<Data name="">`, which reading drops, column and values (#2415). One without a value is
+    /// said by the note on fields with no values, not by this one.
+    #[test]
+    fn kml_says_fields_with_a_blank_name() {
+        let ds = text_layer(&["name", "", " ", "\t"], &[&[Some("a"), Some("x"), Some("y"), None], &[Some("b"), Some("z"), None, None]]);
+        let notes = export_losses_notes(&ds, "kml", name_field(&ds), "t").unwrap();
+        let blank: Vec<&String> = notes.iter().filter(|n| n.contains("blank name")).collect();
+        assert_eq!(
+            blank,
+            ["t: 2 fields with a blank name, and 3 values in them, won't read back: reading KML drops extended data without a name"],
+            "{notes:?}"
+        );
+        // What the note says is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let back = &crate::kml::read("t.kml", &bytes).unwrap()[0].dataset;
+        assert!(back.fields.iter().all(|f| !f.name.trim().is_empty()), "{:?}", back.fields);
+        let clean = text_layer(&["name", "note", " "], &[&[Some("a"), Some("x"), None]]);
+        let notes = export_losses_notes(&clean, "kml", name_field(&clean), "t").unwrap();
+        assert!(!notes.iter().any(|n| n.contains("blank name")), "{notes:?}");
+    }
+
+    #[test]
+    fn kml_says_trimmed_and_blank_text() {
+        let ds = text_layer(
+            &["name", "note", "code", "gone", "folder", "description"],
+            &[
+                &[Some(" a"), Some(" padded "), Some("1"), None, None, Some(" kept ")],
+                &[Some("  "), Some(""), Some(""), None, None, Some("")],
+                &[Some("b"), Some(" "), Some("2"), None, None, None],
+            ],
+        );
+        assert_eq!(
+            text_notes(&ds, "kml"),
+            [
+                "t: 3 text values start or end with spaces, tabs or line breaks, which reading the file back drops, in 'name', 'note'",
+                "t: 2 blank text values read back as empty (null), in 'name', 'code'",
+            ]
+        );
+        assert_eq!(text_notes(&ds, "kmz"), text_notes(&ds, "kml"));
+        // What the notes say is what reading the file back does.
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let back = &crate::kml::read("t.kml", &bytes).unwrap()[0].dataset;
+        let column = |n: &str| back.field_index(n).map(|i| back.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
+        let text = |t: &str| Value::Text(t.into());
+        assert_eq!(column("name"), Some(vec![text("a"), Value::Null, text("b")]));
+        assert_eq!(column("note"), Some(vec![text("padded"), text(""), text("")]));
+        assert_eq!(column("code"), Some(vec![Value::Int(1), Value::Null, Value::Int(2)]));
+        assert_eq!(column("gone"), None);
+        assert_eq!(column("description"), Some(vec![text(" kept "), text(""), Value::Null]));
+        let clean = text_layer(&["name", "note"], &[&[Some("a"), Some("")], &[None, Some("x")]]);
+        assert!(text_notes(&clean, "kml").is_empty());
+    }
+
+    #[test]
+    fn gpx_says_trimmed_and_blank_names() {
+        let ds = text_layer(&["name", "note", "gone", "ele"], &[&[Some("a "), Some("x"), None, None], &[Some(""), None, None, None]]);
+        assert_eq!(
+            text_notes(&ds, "gpx"),
+            [
+                "t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'name'",
+                "t: 1 blank text value reads back as empty (null), in 'name'",
+            ]
+        );
+        // GPX writes only names: one notice says the other fields, with a value first.
+        assert_eq!(
+            gpx_notes(&ds, name_field(&ds), "t"),
+            ["t: GPX holds a name for each feature, so fields weren't written: 'note', 'gone', 'ele'"]
+        );
+        let clean = text_layer(&["name"], &[&[Some("a")], &[None]]);
+        assert!(text_notes(&clean, "gpx").is_empty());
+        assert!(gpx_notes(&clean, name_field(&clean), "t").is_empty());
+        assert!(text_notes(&ds, "geojson").is_empty());
+    }
+
+    /// A placemark or waypoint reading skips (no coordinate in range, or a line of one point)
+    /// holds nothing that comes back.
+    #[test]
+    fn kml_and_gpx_count_only_features_reading_keeps() {
+        let mut ds = text_layer(&["name", "note"], &[&[Some("a"), None]]);
+        ds.push(Some(Geometry::Point(Coord::new(200.0, 0.0))), vec![Value::Text(" off ".into()), Value::Text(" x".into())]);
+        ds.push(Some(Geometry::MultiPoint(vec![])), vec![Value::Text("".into()), Value::Text("".into())]);
+        ds.push(Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0)]])), vec![Value::Text(" ".into()), Value::Text(" ".into())]);
+        // 'note' has values only where reading skips the placemark: its padded text doesn't come
+        // back, but its name still gives a column, of nulls. The skipped placemarks are said.
+        let unread =
+            |n: &str| format!("t: {n} written but won't read back: no coordinate is inside longitude/latitude, or too few for the shape");
+        assert_eq!(text_notes(&ds, "kml"), [unread("3 features are")]);
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let layers = crate::kml::read("t.kml", &bytes).unwrap();
+        assert_eq!(layers.len(), 1);
+        let back = &layers[0].dataset;
+        assert_eq!(back.features.len(), 1);
+        assert_eq!(back.field_index("note").map(|i| back.value(0, i).clone()), Some(Value::Null));
+        // GPX doesn't write the empty multipoint (said as left out); the other two it skips.
+        assert_eq!(text_notes(&ds, "gpx"), [unread("2 features are")]);
+        let (bytes, _) = write_bytes(&ds, "gpx").unwrap();
+        let read = crate::gpx::read("t.gpx", &bytes).unwrap();
+        // One waypoint, and no track (its lone point, unnamed, is among the track points).
+        let count = |name: &str| read.iter().find(|(d, _)| d.name == name).map(|(d, _)| d.features.len());
+        assert_eq!((count("t waypoints"), count("t tracks")), (Some(1), None));
+        // The same values in a feature reading keeps are said.
+        let kept = text_layer(&["name", "note"], &[&[Some(" off "), Some(" x")]]);
+        assert_eq!(text_notes(&kept, "kml").len(), 1);
+        assert_eq!(text_notes(&kept, "gpx").len(), 1);
+    }
+
+    /// A KML name field not called `name` is the placemark's name and its own extended data
+    /// column, read with a type from its values: each value is counted once.
+    #[test]
+    fn a_kml_name_field_of_another_name_counts_each_value_once() {
+        let ds = text_layer(&["title", "other"], &[&[Some(" a"), Some("x")], &[Some(""), Some("y")], &[Some("5"), Some("z")]]);
+        let losses = |ds: &Dataset| TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(0)).notes(&ds.fields, "t");
+        // In the name, " a" is trimmed and "" null; in 'title', a text column, " a" is trimmed too,
+        // the same value.
+        assert_eq!(
+            losses(&ds),
+            [
+                "t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'title'",
+                "t: 1 blank text value reads back as empty (null), in 'title'",
+            ]
+        );
+        let back = crate::interop::to_kml(&ds, Some(0)).unwrap();
+        let read = &crate::kml::read("t.kml", back.as_bytes()).unwrap()[0].dataset;
+        let column = |n: &str| read.field_index(n).map(|i| read.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
+        let text = |t: &str| Value::Text(t.into());
+        assert_eq!(column("name"), Some(vec![text("a"), Value::Null, text("5")]));
+        assert_eq!(column("title"), Some(vec![text("a"), text(""), text("5")]));
+        let clean = text_layer(&["title"], &[&[Some("a")], &[Some("b")]]);
+        assert!(losses(&clean).is_empty());
+    }
+
+    /// A KML name field's placemark name is trimmed even when its own extended data column reads
+    /// as numbers, which keeps the padded number as a number.
+    #[test]
+    fn a_kml_name_of_numbers_is_still_trimmed() {
+        let ds = text_layer(&["code"], &[&[Some(" 5")], &[Some("6")]]);
+        let losses = |ds: &Dataset| TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "kml", Some(0)).notes(&ds.fields, "t");
+        assert_eq!(
+            losses(&ds),
+            ["t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'code'"]
+        );
+        let back = crate::interop::to_kml(&ds, Some(0)).unwrap();
+        let read = &crate::kml::read("t.kml", back.as_bytes()).unwrap()[0].dataset;
+        let column = |n: &str| read.field_index(n).map(|i| read.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>());
+        assert_eq!(column("name"), Some(vec![Value::Text("5".into()), Value::Text("6".into())]));
+        assert_eq!(column("code"), Some(vec![Value::Int(5), Value::Int(6)]));
+        let clean = text_layer(&["code"], &[&[Some("5")], &[Some("6")]]);
+        assert!(losses(&clean).is_empty());
+    }
+
+    /// CSV and dBase read text `<Null>`, in any case and with spaces around it, as null.
+    #[test]
+    fn csv_and_shapefile_say_text_null_markers() {
+        let mut ds = text_layer(&["note"], &[&[Some("<Null>")], &[Some(" <null> ")], &[Some("x")], &[Some("")]]);
+        ds.features.retain(|f| f.geometry.is_some());
+        for ext in ["csv", "zip"] {
+            assert_eq!(text_notes(&ds, ext), ["t: 3 text values, blank or <Null>, read back as empty (null), in 'note'"], "{ext}");
+            let (bytes, _) = write_bytes(&ds, ext).unwrap();
+            let (back, _) = read_bytes(&format!("t.{ext}"), &bytes).unwrap();
+            let i = back.field_index("note").unwrap();
+            let values: Vec<_> = back.features.iter().map(|f| f.attrs[i].clone()).collect();
+            assert_eq!(values, [Value::Null, Value::Null, Value::Text("x".into()), Value::Null], "{ext}");
+        }
+        // Text that only looks like the marker comes back as it is.
+        let mut clean = text_layer(&["note"], &[&[Some("Null")], &[Some("<Null>x")]]);
+        clean.features.retain(|f| f.geometry.is_some());
+        assert!(text_notes(&clean, "csv").is_empty());
+        assert!(text_notes(&clean, "zip").is_empty());
+    }
+
+    /// GPX writes a waypoint for each point of a multipoint, each with the name: reading trims each
+    /// copy, and the value is counted once. The point out of range is a vertex that doesn't read
+    /// back.
+    #[test]
+    fn gpx_counts_a_multipoints_name_once() {
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("name", FieldType::Text)]);
+        let points = vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0), Coord::new(200.0, 0.0)];
+        ds.push(Some(Geometry::MultiPoint(points)), vec![Value::Text(" a".into())]);
+        assert_eq!(
+            text_notes(&ds, "gpx"),
+            [
+                "t: 1 text value starts or ends with spaces, tabs or line breaks, which reading the file back drops, in 'name'",
+                "t: 1 vertex won't read back with the features kept: outside longitude/latitude, or in a part left with too few to keep",
+            ]
+        );
+        let (bytes, _) = write_bytes(&ds, "gpx").unwrap();
+        let read = crate::gpx::read("t.gpx", &bytes).unwrap();
+        let (waypoints, _) = read.iter().find(|(d, _)| d.name == "t waypoints").unwrap();
+        let names: Vec<_> = waypoints.features.iter().map(|f| f.attrs[0].clone()).collect();
+        assert_eq!(names, [Value::Text("a".into()), Value::Text("a".into())]);
+        ds.features[0].attrs = vec![Value::Text("a".into())];
+        ds.features[0].geometry = Some(Geometry::MultiPoint(vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]));
+        assert!(text_notes(&ds, "gpx").is_empty());
+    }
+
+    /// KML and GPX readers drop a vertex outside longitude/latitude one at a time, and a part left
+    /// with too few: the features kept lose those vertices, which are counted.
+    #[test]
+    fn kml_and_gpx_count_vertices_that_dont_read_back() {
+        let c = Coord::new;
+        let geometries = [
+            // One vertex out of range; the line keeps two.
+            Geometry::Line(vec![vec![c(0.0, 0.0), c(200.0, 0.0), c(1.0, 1.0)]]),
+            // A second part left with one vertex is dropped whole: 2 vertices.
+            Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 1.0)], vec![c(2.0, 2.0), c(0.0, 95.0)]]),
+            // Two points of three out of range.
+            Geometry::MultiPoint(vec![c(0.0, 0.0), c(181.0, 0.0), c(0.0, -91.0)]),
+        ];
+        let mut ds = Dataset::new("t", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        for g in geometries {
+            ds.push(Some(g), vec![Value::Text("a".into())]);
+        }
+        let vertices = |n: usize| {
+            format!(
+                "t: {n} vertices won't read back with the features kept: outside longitude/latitude, or in a part left with too few to keep"
+            )
+        };
+        assert_eq!(text_notes(&ds, "kml"), [vertices(5)]);
+        assert_eq!(text_notes(&ds, "gpx"), [vertices(5)]);
+        // Reading the file back keeps the other 5 of the 10 vertices written.
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let read = crate::kml::read("t.kml", &bytes).unwrap();
+        let kept: usize =
+            read.iter().flat_map(|l| &l.dataset.features).filter_map(|f| f.geometry.as_ref()).map(Geometry::coord_count).sum();
+        assert_eq!(kept, 10 - 5);
+        // A polygon: an outer ring of four in range keeps them; a hole left with two is dropped
+        // (4 vertices), and a part whose outer ring is left with two is dropped with its hole.
+        let square = |x: f64| vec![c(x, 0.0), c(x + 1.0, 0.0), c(x + 1.0, 1.0), c(x, 0.0)];
+        let polygon = Geometry::Polygon(vec![
+            vec![square(0.0), vec![c(0.1, 0.1), c(200.0, 0.0), c(200.0, 1.0), c(0.1, 0.1)]],
+            vec![vec![c(2.0, 0.0), c(300.0, 0.0), c(300.0, 1.0), c(2.0, 1.0)], square(2.0)],
+        ]);
+        let mut ds = Dataset::new("t", GeometryType::Polygon, vec![Field::new("name", FieldType::Text)]);
+        ds.push(Some(polygon), vec![Value::Text("a".into())]);
+        assert_eq!(text_notes(&ds, "kml"), [vertices(12)]);
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let read = crate::kml::read("t.kml", &bytes).unwrap();
+        assert_eq!(read[0].dataset.features[0].geometry, Some(Geometry::Polygon(vec![vec![square(0.0)]])));
+        // GPX writes the outer rings as a track: the second is left with two, so isn't dropped.
+        assert_eq!(text_notes(&ds, "gpx"), [vertices(2)]);
+        // In range, nothing is said.
+        let mut clean = Dataset::new("t", GeometryType::Polyline, vec![Field::new("name", FieldType::Text)]);
+        clean.push(Some(Geometry::Line(vec![vec![c(0.0, 0.0), c(180.0, 90.0)]])), vec![Value::Text("a".into())]);
+        clean.push(Some(Geometry::MultiPoint(vec![c(-180.0, -90.0), c(1.0, 1.0)])), vec![Value::Text("b".into())]);
+        clean.push(Some(Geometry::Polygon(vec![vec![square(0.0), square(0.0)]])), vec![Value::Text("c".into())]);
+        assert!(text_notes(&clean, "kml").is_empty());
+        assert!(text_notes(&clean, "gpx").is_empty());
+    }
+
+    /// KML reads a layer for each kind of geometry and types each one's columns apart: a blank in
+    /// the points' column of numbers reads as null, one in the lines' column of text doesn't.
+    #[test]
+    fn kml_types_each_kind_of_geometry_apart() {
+        let line = || Some(Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(1.0, 1.0)]]));
+        let point = |x: f64| Some(Geometry::Point(Coord::new(x, 1.0)));
+        let mut ds = Dataset::new("t", GeometryType::Point, vec![Field::new("code", FieldType::Text)]);
+        for (g, v) in [(point(0.0), "1"), (point(1.0), ""), (line(), "x"), (line(), "")] {
+            ds.push(g, vec![Value::Text(v.into())]);
+        }
+        assert_eq!(text_notes(&ds, "kml"), ["t: 1 blank text value reads back as empty (null), in 'code'"]);
+        let (bytes, _) = write_bytes(&ds, "kml").unwrap();
+        let layers = crate::kml::read("t.kml", &bytes).unwrap();
+        let code = |l: usize| {
+            let d = &layers[l].dataset;
+            let i = d.field_index("code").unwrap();
+            d.features.iter().map(|f| f.attrs[i].clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(code(0), [Value::Int(1), Value::Null]);
+        assert_eq!(code(1), [Value::Text("x".into()), Value::Text("".into())]);
+        // Lines alone: their blank is kept.
+        ds.features.retain(|f| matches!(f.geometry, Some(Geometry::Line(_))));
+        assert!(text_notes(&ds, "kml").is_empty());
+    }
+
+    /// A streamed CSV export adds up its chunks' text losses to the whole layer's, and types a
+    /// column over all of them: 'code' reads as numbers only from the second chunk on.
+    #[test]
+    fn text_losses_of_chunks_add_up_to_the_whole_layer() {
+        let ds = text_layer(
+            &["note", "code"],
+            &[&[Some(""), Some(" ")], &[Some("  "), Some("")], &[Some("x"), Some("12")], &[None, Some("  ")]],
+        );
+        let whole = TextLosses::of(&ds.features, &ds.fields, ds.geometry_type, "csv", None);
+        for size in 1..=ds.features.len() {
+            let mut sum = TextLosses::default();
+            for chunk in ds.features.chunks(size) {
+                sum += TextLosses::of(chunk, &ds.fields, ds.geometry_type, "csv", None);
+            }
+            assert_eq!(sum, whole, "chunks of {size}");
+        }
+        assert_eq!(whole.notes(&ds.fields, "t"), ["t: 5 blank text values read back as empty (null), in 'note', 'code'"]);
+        // Alone, the first chunk's 'code' is text, which keeps its spaces.
+        let first = TextLosses::of(&ds.features[..1], &ds.fields, ds.geometry_type, "csv", None);
+        assert_eq!(first.notes(&ds.fields, "t"), ["t: 1 blank text value reads back as empty (null), in 'note'"]);
+        // A column that is Text skips the values after, and chunks still add up to the whole: a
+        // whole number past a Double's digits, alone a chunk's Integer, is Text after text.
+        let wide = text_layer(&["id"], &[&[Some("abc")], &[Some("9007199254740993")], &[Some(" ")]]);
+        let whole = TextLosses::of(&wide.features, &wide.fields, wide.geometry_type, "csv", None);
+        for size in 1..=wide.features.len() {
+            let mut sum = TextLosses::default();
+            for chunk in wide.features.chunks(size) {
+                sum += TextLosses::of(chunk, &wide.fields, wide.geometry_type, "csv", None);
+            }
+            assert_eq!(sum, whole, "chunks of {size}");
+        }
+        assert_eq!(whole.notes(&wide.fields, "t"), Vec::<String>::new());
+        // The NUL and apostrophe counts add up too (#2415).
+        for (ext, layer, said) in [
+            ("csv", text_layer(&["note"], &[&[Some("'=x")], &[Some("y")], &[Some("'+z")]]), "2 text values start with an apostrophe"),
+            ("shp", text_layer(&["note"], &[&[Some("a\0b")], &[Some("y")], &[Some("ab \0c")]]), "2 text values hold a NUL"),
+        ] {
+            let whole = TextLosses::of(&layer.features, &layer.fields, layer.geometry_type, ext, None);
+            for size in 1..=layer.features.len() {
+                let mut sum = TextLosses::default();
+                for chunk in layer.features.chunks(size) {
+                    sum += TextLosses::of(chunk, &layer.fields, layer.geometry_type, ext, None);
+                }
+                assert_eq!(sum, whole, "{ext}: chunks of {size}");
+            }
+            let notes = whole.notes(&layer.fields, "t");
+            assert!(notes.iter().any(|n| n.contains(said)), "{ext}: {notes:?}");
+        }
     }
 
     /// GPX names fields with values before fields of nulls, so a field that lost data isn't
@@ -6479,7 +8199,11 @@ mod tests {
             for (read, (back, report)) in [("whole", whole), ("streamed", streamed)] {
                 assert_eq!(back.features[1].attrs[0], Value::Null, "{read}");
                 let said = "permits: 1 value written as Null was read as empty, in 'issued'";
-                assert!(report.messages.iter().any(|m| m == said), "{read}: {:?}", report.messages);
+                assert!(
+                    report.messages.iter().any(|m| m.as_str() == said && m.loss == Some(crate::loss::LossCode::AssumedNullMarker)),
+                    "{read}: {:?}",
+                    report.messages
+                );
                 assert!(!report.messages.iter().any(|m| m.contains("date")), "{read}: {:?}", report.messages);
             }
         }
@@ -6512,7 +8236,11 @@ mod tests {
             assert_eq!(ds.fields[3].ty, FieldType::Double, "{what}: `<Null>` doesn't type a column");
             assert_eq!(column(3), [Value::Float(1.5), Value::Null, Value::Float(2.5), Value::Float(3.5)], "{what}");
             let said = "3 values written as Null were read as empty, in 'code', 'note', 'x'";
-            assert!(report.messages.iter().any(|m| m == said), "{what}: {:?}", report.messages);
+            assert!(
+                report.messages.iter().any(|m| m.as_str() == said && m.loss == Some(crate::loss::LossCode::AssumedNullMarker)),
+                "{what}: {:?}",
+                report.messages
+            );
         }
         let (_, report) = read_csv("code\n 2535\n", "t").unwrap();
         assert!(report.messages.iter().all(|m| !m.contains("written as Null")), "{:?}", report.messages);
@@ -6787,6 +8515,51 @@ mod tests {
         assert!(rep.messages.iter().any(|m| m.contains("1 number isn't finite") && m.contains("'lat'")), "{:?}", rep.messages);
     }
 
+    /// A GeoJSON read in the system its legacy `crs` member names is written back in
+    /// longitude/latitude, converted through WGS 84 first, as the format is: UTM 32N, Ingolstadt.
+    #[test]
+    fn a_held_geojson_is_written_in_lonlat() {
+        let at = Coord::new(11.5, 48.7);
+        let utm = Crs::Epsg(32632).transformer().unwrap().from_lonlat(at).unwrap();
+        let text = format!(
+            r#"{{"type":"FeatureCollection","crs":{{"type":"name","properties":{{"name":"urn:ogc:def:crs:EPSG::32632"}}}},"features":[{{"type":"Feature","properties":{{}},"geometry":{{"type":"Point","coordinates":[{},{}]}}}}]}}"#,
+            utm.x, utm.y
+        );
+        let (ds, _) = read_geojson(&text, "held").unwrap();
+        assert_eq!(ds.coord_crs(), Crs::Epsg(32632));
+        let out = to_geojson(&ds.in_lonlat().unwrap());
+        let c = &out["features"][0]["geometry"]["coordinates"];
+        let (x, y) = (c[0].as_f64().unwrap(), c[1].as_f64().unwrap());
+        assert!((x - at.x).abs() < 1e-9 && (y - at.y).abs() < 1e-9, "{c}");
+        assert!(out.get("crs").is_none());
+    }
+
+    /// A `.prj` that doesn't match the coordinates (a geographic system for numbers past 180°) is
+    /// said, though the file is held in its system as it is, as it was when it was converted.
+    #[test]
+    fn a_shapefile_whose_prj_doesnt_fit_is_said() {
+        use shapefile::dbase::{FieldValue, Record, TableWriterBuilder};
+        let dir = std::env::temp_dir().join(format!("rustgis-shp-prj-misfit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shp = dir.join("misfit.shp");
+        {
+            let table = TableWriterBuilder::new().add_character_field("name".try_into().unwrap(), 10);
+            let mut w = shapefile::Writer::from_path(&shp, table).unwrap();
+            let mut r = Record::default();
+            r.insert("name".into(), FieldValue::Character(Some("far".into())));
+            w.write_shape_and_record(&shapefile::Point::new(500.0, 10.0), &r).unwrap();
+        }
+        let prj = r#"GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+        std::fs::write(dir.join("misfit.prj"), prj).unwrap();
+        let (_, rep) = read_path(&shp).unwrap();
+        assert!(
+            rep.messages.iter().any(|m| m.contains("not longitude/latitude") || m.contains("couldn't be converted")),
+            "{:?}",
+            rep.messages
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A projected Shapefile is converted to longitude/latitude by its `.prj` (issue #84).
     #[test]
     fn shapefile_prj_reprojects() {
@@ -6802,7 +8575,8 @@ mod tests {
             // Paris in UTM zone 31N.
             w.write_shape_and_record(&shapefile::Point::new(451_219.33, 5_411_550.20), &r).unwrap();
         }
-        let at = |ds: &Dataset| ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+        // In longitude/latitude, from the system the read holds it in.
+        let at = |ds: &Dataset| ds.in_lonlat().unwrap().features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
 
         // As ArcGIS and GDAL write it: Esri WKT with no EPSG authority.
         let prj = r#"PROJCS["WGS_1984_UTM_Zone_31N",GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",3.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
@@ -6846,7 +8620,7 @@ mod tests {
             }
             shp
         };
-        let said = |m: &[String]| m.iter().any(|m| m.contains("isn't a number"));
+        let said = |m: &[crate::loss::Note]| m.iter().any(|m| m.contains("isn't a number"));
         let bad = write("bad.shp", &[(f64::NAN, 20.0), (11.0, 21.0), (f64::INFINITY, 22.0)]);
         let (ds, rep) = read_path(&bad).unwrap();
         assert_eq!(ds.features.len(), 3, "the features are kept");
@@ -6856,10 +8630,8 @@ mod tests {
         assert_eq!(ds.geometry_type, GeometryType::Point);
         assert_eq!(ds.unsaved_coordinates(), 0);
         assert!(
-            rep.messages.contains(
-                &"bad: 2 shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"
-                    .to_string()
-            ),
+            rep.messages
+                .says("bad: 2 shape(s) have a coordinate that isn't a number (NaN or infinite): their features are kept without geometry"),
             "{:?}",
             rep.messages
         );
@@ -6901,7 +8673,7 @@ mod tests {
             }
             std::fs::write(shp.with_extension("prj"), f[5]).unwrap();
             let (ds, report) = read_path(&shp).unwrap();
-            let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+            let c = ds.in_lonlat().unwrap().features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
             assert!((c.x - lon).abs() < 1e-7 && (c.y - lat).abs() < 1e-7, "EPSG:{code}: {c:?}");
             assert!(report.messages.is_empty(), "EPSG:{code}: {:?}", report.messages);
         }
@@ -7090,7 +8862,7 @@ mod tests {
         let layers = read_zip_in("projected.zip", &zip, Some(crs)).unwrap();
         assert_eq!(layers.len(), 2);
         for (table, report) in layers {
-            let point = table.features[0].geometry.as_ref().unwrap().label_point().unwrap();
+            let point = table.in_lonlat().unwrap().features[0].geometry.as_ref().unwrap().label_point().unwrap();
             assert!((point.x - 15.0).abs() < 1e-6 && (point.y - 42.0).abs() < 1e-6, "{point:?}");
             assert_eq!(table.crs, Some(crs));
             assert!(report.messages.is_empty(), "{:?}", report.messages);
@@ -7328,7 +9100,7 @@ mod tests {
         assert_eq!(layers.len(), 2);
         let (ds, rep) = &layers[0];
         assert_eq!(ds.name, "Paris");
-        let c = ds.features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
+        let c = ds.in_lonlat().unwrap().features[0].geometry.as_ref().and_then(Geometry::label_point).unwrap();
         assert!((c.x - 2.335).abs() < 1e-6 && (c.y - 48.855).abs() < 1e-6, "{c:?}");
         assert!(rep.messages.iter().any(|m| m.contains("ne_VERSION.txt")), "{:?}", rep.messages);
         assert_eq!(ds.value(0, 0), &Value::Text("paris".into()));
@@ -7389,7 +9161,7 @@ mod tests {
         // A long list of skipped members names the first ones and counts the rest.
         let layers = read_zip("x.zip", &crate::zip::write(&mifs(MAX_ZIP_LAYERS + 25)).unwrap()).unwrap();
         let note = &layers[0].1.messages[0];
-        assert!(note.contains("m51.mif") && !note.contains("m52.mif") && note.ends_with("; and 5 more"), "{note}");
+        assert!(note.contains("m51.mif") && !note.contains("m52.mif") && note.ends_with("; and 5 more"), "{note:?}");
     }
 
     /// A Shapefile's loose files picked or dropped together are zipped into one, which reads as a
@@ -7649,7 +9421,8 @@ mod tests {
             assert_eq!(days, [at("2026-03-05"), Value::Null, Value::Null, at("0001-01-01"), Value::Null], "{read}");
             assert!(back.features.iter().all(|f| f.geometry.is_some()), "{read}");
             let note = report.messages.iter().find(|m| m.contains("date")).unwrap_or_else(|| panic!("{read}: {report:?}"));
-            assert_eq!(note, "permits: 1 value isn't a date and was read as empty, in 'issued'", "{read}");
+            assert_eq!(note.as_str(), "permits: 1 value isn't a date and was read as empty, in 'issued'", "{read}");
+            assert_eq!(note.loss, Some(crate::loss::LossCode::DroppedValue), "{read}");
         }
     }
 
@@ -7798,5 +9571,291 @@ mod tests {
         assert_eq!(read_back.features[0].attrs[0], Value::Float(10.0));
         assert_eq!(read_back.fields[1].ty, FieldType::Integer);
         assert_eq!(read_back.features[0].attrs[1], Value::Int(1));
+    }
+
+    /// A layer held in its own system (UTM 32N here; every layer's is longitude/latitude until
+    /// #2032 C2) is written from it: in longitude/latitude for a format that holds only those, in
+    /// another system by the direct operation between the two, and in its own as it is.
+    #[test]
+    fn a_layer_is_written_from_the_system_it_holds() {
+        let (utm, etrs) = (Crs::Epsg(32632), Crs::Epsg(25832));
+        let lonlat = Coord::new(9.0, 48.7);
+        let at = utm.transformer().unwrap().from_lonlat(lonlat).unwrap();
+        let mut ds = Dataset::new("held", GeometryType::Point, vec![]);
+        ds.push(Some(Geometry::Point(at)), vec![]);
+        ds.held_in = utm;
+        assert_eq!(ds.coord_crs(), utm);
+        // GeoJSON: longitude/latitude.
+        let (bytes, _) = write_bytes_in(&ds, "geojson", Crs::LonLat).unwrap();
+        let read = read_bytes("held.geojson", &bytes).unwrap().0;
+        let Some(Geometry::Point(p)) = read.features[0].geometry.clone() else { panic!("a point") };
+        assert!((p.x - lonlat.x).abs() < 1e-9 && (p.y - lonlat.y).abs() < 1e-9, "{p:?}");
+        // Its own system: the coordinates as they are.
+        let same = project(&ds, utm).unwrap();
+        assert_eq!(same.features[0].geometry, ds.features[0].geometry);
+        // Another: by the direct operation from it.
+        let other = project(&ds, etrs).unwrap();
+        let want = utm.to(etrs).unwrap().point(at).unwrap();
+        assert_eq!(other.features[0].geometry, Some(Geometry::Point(want)));
+        // A file written whole, in the layer's own system, and in longitude/latitude.
+        let d = std::env::temp_dir().join(format!("rustgis-held-writes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        write_path_in(&ds, &d.join("own.fgb"), utm).unwrap();
+        write_path_in(&ds, &d.join("lonlat.csv"), Crs::LonLat).unwrap();
+        for name in ["own.fgb", "lonlat.csv"] {
+            let read = read_path(&d.join(name)).unwrap().0.in_lonlat().unwrap().into_owned();
+            let Some(Geometry::Point(p)) = read.features[0].geometry.clone() else { panic!("{name}: a point") };
+            assert!((p.x - lonlat.x).abs() < 1e-9 && (p.y - lonlat.y).abs() < 1e-9, "{name}: {p:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The notes of an export of a layer held in its own system (UTM 32N here) are those of what
+    /// is written: a CSV's of the longitude/latitude it writes (as for the same layer held in
+    /// them), and a Shapefile's vertices left out only when it is written as held.
+    #[test]
+    fn an_exports_notes_are_of_what_it_writes() {
+        let utm = Crs::Epsg(32632);
+        // With x and y fields, which a CSV reader could take for the position: a point the file
+        // can't give a longitude/latitude would be said.
+        let fields = vec![Field::new("x", FieldType::Double), Field::new("y", FieldType::Double)];
+        let mut lonlat = Dataset::new("held", GeometryType::Point, fields);
+        for (lon, lat) in [(9.0, 48.7), (10.0, 50.0)] {
+            lonlat.push(Some(Geometry::Point(Coord::new(lon, lat))), vec![Value::Float(1.0), Value::Float(2.0)]);
+        }
+        let want = export_losses_notes(&lonlat, "csv", None, "out.csv").unwrap();
+        let held = project(&lonlat, utm).unwrap();
+        assert_eq!(held.coord_crs(), utm);
+        assert_eq!(export_losses_notes(&held, "csv", None, "out.csv").unwrap(), want);
+        // A line with a missing coordinate: its vertex is left out of a Shapefile written as
+        // held, and noted; in any other system the export's conversion refuses the line instead
+        // (`project`), so there is nothing to note.
+        let mut line = Dataset::new("line", GeometryType::Polyline, vec![]);
+        let parts = vec![vec![Coord::new(500_000.0, 5_400_000.0), Coord::new(f64::NAN, 5_400_100.0), Coord::new(500_100.0, 5_400_200.0)]];
+        line.push(Some(Geometry::Line(parts)), vec![]);
+        line.held_in = utm;
+        let own = shapefile_geometry_notes(&line, "out.shp", utm);
+        assert!(own.iter().any(|n| n.contains("1 vertex with a missing or infinite coordinate")), "{own:?}");
+        assert!(shapefile_geometry_notes(&line, "out.shp", Crs::Epsg(25832)).is_empty());
+    }
+
+    /// The `.dbf` of three points, named `a`, `b` and `c`, with a numeric `n` of 1, 2 and 3.
+    fn three_named_points(dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("pts.shp");
+        let fields = vec![Field::new("name", FieldType::Text), Field::new("n", FieldType::Integer)];
+        let mut ds = Dataset::new("pts", GeometryType::Point, fields);
+        for (k, name) in ["a", "b", "c"].iter().enumerate() {
+            let x = k as f64;
+            ds.push(Some(Geometry::Point(Coord::new(x, x))), vec![Value::Text((*name).into()), Value::Int(k as i64 + 1)]);
+        }
+        write_path(&ds, &path).unwrap();
+        path
+    }
+
+    /// Where record `k` of a `.dbf` starts (its deletion flag).
+    fn dbf_record_at(dbf: &[u8], k: usize) -> usize {
+        let header = usize::from(u16::from_le_bytes([dbf[8], dbf[9]]));
+        let len = usize::from(u16::from_le_bytes([dbf[10], dbf[11]]));
+        header + k * len
+    }
+
+    /// A Shapefile whose `.dbf` marks its middle record deleted: that record's shape is left out
+    /// with it, each kept shape keeps its own attributes (dBASE's reader passing over the record
+    /// once paired every later shape with the next record, and dropped the last shape), and one
+    /// notice gives the count. A clean file says nothing of it.
+    #[test]
+    fn a_deleted_dbf_record_leaves_its_shape_out_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = three_named_points(dir.path());
+        let deleted = |r: &ReadReport| r.messages.iter().filter(|m| m.contains("marked deleted")).count();
+        let (clean, report) = read_shapefile_in(&path, "pts", None).unwrap();
+        assert_eq!(clean.features.len(), 3);
+        assert_eq!(deleted(&report), 0, "{:?}", report.messages);
+        let dbf_path = path.with_extension("dbf");
+        let mut dbf = std::fs::read(&dbf_path).unwrap();
+        let at = dbf_record_at(&dbf, 1);
+        dbf[at] = b'*';
+        std::fs::write(&dbf_path, &dbf).unwrap();
+        let (ds, report) = read_shapefile_in(&path, "pts", None).unwrap();
+        let kept: Vec<_> = ds
+            .features
+            .iter()
+            .map(|f| {
+                let Some(Geometry::Point(p)) = f.geometry.clone() else { panic!("a point") };
+                (p.x, f.attrs[0].clone())
+            })
+            .collect();
+        assert_eq!(kept, [(0.0, Value::Text("a".into())), (2.0, Value::Text("c".into()))]);
+        assert_eq!(deleted(&report), 1, "{:?}", report.messages);
+        assert!(
+            report.messages.iter().any(|m| m == "pts: 1 dBASE record marked deleted was left out, with its shape"),
+            "{:?}",
+            report.messages
+        );
+        assert_eq!(report.skipped, 0);
+    }
+
+    /// A shape that can't be read is left out with its own record, counted: the later shapes keep
+    /// theirs (`shapefile`'s pairing read no record for it, shifting every later one), whether or
+    /// not the record is also marked deleted.
+    #[test]
+    fn an_unreadable_shape_leaves_its_own_record_out() {
+        for deleted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = three_named_points(dir.path());
+            // The first record's shape type (after the 100-byte header and 8-byte record header).
+            let mut shp = std::fs::read(&path).unwrap();
+            shp[108..112].copy_from_slice(&99i32.to_le_bytes());
+            std::fs::write(&path, &shp).unwrap();
+            if deleted {
+                let dbf_path = path.with_extension("dbf");
+                let mut dbf = std::fs::read(&dbf_path).unwrap();
+                let at = dbf_record_at(&dbf, 0);
+                dbf[at] = b'*';
+                std::fs::write(&dbf_path, &dbf).unwrap();
+            }
+            let (ds, report) = read_shapefile_in(&path, "pts", None).unwrap();
+            let names: Vec<_> = ds.features.iter().map(|f| f.attrs[0].clone()).collect();
+            assert_eq!(names, [Value::Text("b".into()), Value::Text("c".into())], "deleted: {deleted}");
+            assert_eq!(report.skipped, usize::from(!deleted), "{:?}", report.messages);
+        }
+    }
+
+    /// With a `.shx`, the shapes past the `.dbf`'s last record are all counted, those that can't
+    /// be read too.
+    #[test]
+    fn shapes_past_the_last_record_are_all_counted_with_an_shx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = three_named_points(dir.path());
+        let dbf_path = path.with_extension("dbf");
+        let mut dbf = std::fs::read(&dbf_path).unwrap();
+        dbf[4..8].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&dbf_path, &dbf).unwrap();
+        // The second shape's type: each point record is 8 + 20 bytes.
+        let mut shp = std::fs::read(&path).unwrap();
+        shp[136..140].copy_from_slice(&99i32.to_le_bytes());
+        std::fs::write(&path, &shp).unwrap();
+        let (ds, report) = read_shapefile_in(&path, "pts", None).unwrap();
+        assert_eq!(ds.features.len(), 1);
+        let want = "pts: 2 shape(s) past the .dbf's last record have no attributes and were left out (1 of them can't be read)";
+        assert!(
+            report.messages.iter().any(|m| m.as_str() == want && m.loss == Some(crate::loss::LossCode::DroppedFeature)),
+            "{:?}",
+            report.messages
+        );
+    }
+
+    /// Without a `.shx`, a shape that can't be read ends the pairing: the shapes after it can't be
+    /// found, so the records after it are left out and said rather than paired with what is read
+    /// from inside the broken shape.
+    #[test]
+    fn without_an_shx_an_unreadable_shape_ends_the_pairing() {
+        for deleted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = three_named_points(dir.path());
+            std::fs::remove_file(path.with_extension("shx")).unwrap();
+            let mut shp = std::fs::read(&path).unwrap();
+            shp[108..112].copy_from_slice(&99i32.to_le_bytes());
+            std::fs::write(&path, &shp).unwrap();
+            if deleted {
+                let dbf_path = path.with_extension("dbf");
+                let mut dbf = std::fs::read(&dbf_path).unwrap();
+                let at = dbf_record_at(&dbf, 0);
+                dbf[at] = b'*';
+                std::fs::write(&dbf_path, &dbf).unwrap();
+            }
+            let (ds, report) = read_shapefile_in(&path, "pts", None).unwrap();
+            assert!(ds.features.is_empty(), "deleted: {deleted}");
+            let last = {
+                let dir = tempfile::tempdir().unwrap();
+                let path = three_named_points(dir.path());
+                std::fs::remove_file(path.with_extension("shx")).unwrap();
+                let mut shp = std::fs::read(&path).unwrap();
+                // The third shape's type: each point record is 8 + 20 bytes.
+                shp[164..168].copy_from_slice(&99i32.to_le_bytes());
+                std::fs::write(&path, &shp).unwrap();
+                read_shapefile_in(&path, "pts", None).unwrap()
+            };
+            assert_eq!((last.0.features.len(), last.1.skipped), (2, 1));
+            assert!(last.1.messages.iter().all(|m| !m.contains("no .shx") && !m.contains("past the")), "{:?}", last.1.messages);
+            assert!(
+                report.messages.iter().any(|m| m.contains("no .shx to find the next one by: the 2 record(s) after it were left out")),
+                "{:?}",
+                report.messages
+            );
+        }
+    }
+
+    /// A `.dbf` one record short leaves the last shape out, and says so; one with a record more
+    /// than the shapes says that. A matching pair says neither.
+    #[test]
+    fn shapes_and_records_that_dont_pair_are_said() {
+        let said = |r: &ReadReport| {
+            r.messages
+                .iter()
+                .filter(|m| m.contains("past the") && m.loss == Some(crate::loss::LossCode::DroppedFeature))
+                .map(|m| m.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = three_named_points(dir.path());
+        let (ds, report) = read_shapefile_in(&path, "pts", None).unwrap();
+        assert_eq!(ds.features.len(), 3);
+        assert!(said(&report).is_empty(), "{:?}", report.messages);
+        let dbf_path = path.with_extension("dbf");
+        let clean = std::fs::read(&dbf_path).unwrap();
+        for (records, want) in [
+            (2u32, "pts: 1 shape(s) past the .dbf's last record have no attributes and were left out"),
+            (4, "pts: 1 dBASE record(s) past the .shp's last shape have no shape and were left out"),
+        ] {
+            let mut dbf = clean.clone();
+            dbf[4..8].copy_from_slice(&records.to_le_bytes());
+            if records == 4 {
+                // A fourth record, a copy of the third, before the end-of-file marker.
+                let (at, len) = (dbf_record_at(&dbf, 2), dbf_record_at(&dbf, 1) - dbf_record_at(&dbf, 0));
+                let row = dbf[at..at + len].to_vec();
+                dbf.splice(at + len..at + len, row);
+            }
+            std::fs::write(&dbf_path, &dbf).unwrap();
+            let (ds, report) = read_shapefile_in(&path, "pts", None).unwrap();
+            assert_eq!(ds.features.len(), records.min(3) as usize);
+            assert_eq!(said(&report), [want]);
+        }
+    }
+
+    /// A standalone table: a record marked deleted is left out and counted, and one dBASE can't
+    /// read (a number that isn't one) is left out and said, with the rows on both sides kept.
+    /// Clean input says neither.
+    #[test]
+    fn a_dbf_table_counts_deleted_and_unreadable_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = three_named_points(dir.path());
+        let clean = std::fs::read(path.with_extension("dbf")).unwrap();
+        let notes = |r: &ReadReport| {
+            r.messages
+                .iter()
+                .filter(|m| m.contains("marked deleted") || m.contains("unreadable"))
+                .map(|m| m.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let (ds, report) = read_bytes("t.dbf", &clean).unwrap();
+        assert_eq!(ds.features.len(), 3);
+        assert!(notes(&report).is_empty(), "{:?}", report.messages);
+        let mut one_deleted = clean.clone();
+        let at = dbf_record_at(&one_deleted, 1);
+        one_deleted[at] = b'*';
+        let (ds, report) = read_bytes("t.dbf", &one_deleted).unwrap();
+        assert_eq!(ds.features.iter().map(|f| f.attrs[0].clone()).collect::<Vec<_>>(), [Value::Text("a".into()), Value::Text("c".into())]);
+        assert_eq!(notes(&report), ["t: 1 dBASE record marked deleted was left out"]);
+        // The `n` column follows the 1-byte flag and the `name` column.
+        let mut unreadable = clean.clone();
+        let name_len = usize::from(unreadable[32 + 16]);
+        let at = dbf_record_at(&unreadable, 1) + 1 + name_len;
+        let n_len = usize::from(unreadable[64 + 16]);
+        unreadable[at..at + n_len].fill(b'x');
+        let (ds, report) = read_bytes("t.dbf", &unreadable).unwrap();
+        assert_eq!(ds.features.iter().map(|f| f.attrs[0].clone()).collect::<Vec<_>>(), [Value::Text("a".into()), Value::Text("c".into())]);
+        assert_eq!(notes(&report), ["t: 1 dBASE record was unreadable and left out"]);
     }
 }

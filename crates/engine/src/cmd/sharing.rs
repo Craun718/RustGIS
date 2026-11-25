@@ -179,16 +179,15 @@ pub fn commands() -> Vec<C> {
             crate::model::check_file(&v)?;
             let name = v["name"].as_str().unwrap_or("Tool").chars().take(200).collect::<String>();
             // A model file (`*.model.json`) holds a graph; a web tool its steps.
-            let mark = s.notice_mark();
             let imported = if let Some(graph) = v.get("graph") {
                 s.run("model.new", &json!({"name": name, "graph": graph, "imported": true}))?
             } else {
-                let steps = v.get("steps").cloned().ok_or("not a RustGIS model or web tool (no graph or steps)")?;
+                let steps = v.get("steps").cloned().ok_or(crate::model::NOT_A_MODEL)?;
                 s.run("model.new", &json!({"name": name, "steps": steps, "imported": true}))?
             };
             // A name `model.new` cut to tell it apart is said once, by it (#1923), unless this cut
             // it first: `model.new` saw only the first 200 characters, so that cut is said here.
-            let said = s.notices_since(mark).iter().any(|n| n.text.starts_with("ModelBuilder: a model has that name already"));
+            let said = imported.get("cut").and_then(Value::as_bool).unwrap_or(false);
             let cut_here = v["name"].as_str().is_some_and(|n| n.chars().count() > 200);
             if (cut_here || !said) && v.get("name").map_or(Some("Tool"), Value::as_str) != imported.get("model").and_then(Value::as_str) {
                 // A cut to the 200 says how much it cut.
@@ -236,19 +235,50 @@ pub(crate) fn share_output(s: &mut Session, kind: &str, p: &Value) -> Result<(St
     Ok((name, bytes, source, notes))
 }
 
+/// Features shared without their geometry, as a place of each can't be given in
+/// longitude/latitude: counted over the layers of one share, said once
+/// ([`rustgis_data::unplaced_note`]).
+#[derive(Default)]
+struct Unplaced {
+    n: usize,
+    layers: Vec<String>,
+}
+
+impl Unplaced {
+    fn add(&mut self, layer: &str, n: usize) {
+        if n > 0 {
+            self.n += n;
+            if !self.layers.iter().any(|l| l == layer) {
+                self.layers.push(layer.to_string());
+            }
+        }
+    }
+
+    fn say(self, s: &mut Session, what: &str) {
+        if let Some(note) = rustgis_data::unplaced_note(what, &self.layers.join(", "), self.n) {
+            s.notify(note, false);
+        }
+    }
+}
+
 /// Build the saved payload for each share kind; web tools carry capabilities of their steps.
 fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, Vec<u8>, String), String> {
     match kind {
         "webMap" => {
             let mut m = map_of(s, p)?;
             m.layers.iter_mut().filter(|l| shared_layer("webMap", l)).try_for_each(|l| load_whole(s, l))?;
-            let html = web_map_html(&m, &m.name)?;
+            let mut unplaced = Unplaced::default();
+            let html = web_map_html(&m, &m.name, &mut unplaced)?;
+            unplaced.say(s, "The web map");
             Ok((m.name.clone(), html.into_bytes(), m.name))
         }
         "webLayer" => {
             let mut l = layer_of(s, p)?;
             load_whole(s, &mut l)?;
-            Ok((l.name.clone(), web_layer_zip(s, &l)?, l.name.clone()))
+            let mut unplaced = Unplaced::default();
+            let zip = web_layer_zip(s, &l, &mut unplaced)?;
+            unplaced.say(s, "The web layer");
+            Ok((l.name.clone(), zip, l.name.clone()))
         }
         "webStyle" => {
             let l = layer_of(s, p)?;
@@ -259,7 +289,9 @@ fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, 
             let l = layer_of(s, p)?;
             let fields: Option<Vec<String>> =
                 p.get("fields").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect());
-            let loc = locator(&l, fields.as_deref())?;
+            let mut unplaced = Unplaced::default();
+            let loc = locator(&l, fields.as_deref(), &mut unplaced)?;
+            unplaced.say(s, "The locator");
             Ok((l.name.clone(), serde_json::to_vec(&loc).map_err(|e| e.to_string())?, l.name.clone()))
         }
         "geodataService" => {
@@ -267,7 +299,12 @@ fn share_bytes_inner(s: &mut Session, kind: &str, p: &Value) -> Result<(String, 
             m.layers.iter_mut().filter(|l| shared_layer("geodataService", l)).try_for_each(|l| load_whole(s, l))?;
             let mut layers: Vec<&Dataset> = m.layers.iter().filter(|l| shared_layer("geodataService", l)).map(|l| &l.dataset).collect();
             layers.extend(s.project.tables.iter().map(|t| &t.dataset));
-            Ok((m.name.clone(), ogc_zip(&m.name, &layers, &[])?, m.name.clone()))
+            let mut unplaced = Unplaced::default();
+            let zip = ogc_zip(&m.name, &layers, &[], &mut unplaced)?;
+            let name = m.name.clone();
+            drop(layers);
+            unplaced.say(s, "The geodata service");
+            Ok((name.clone(), zip, name))
         }
         "webTool" => {
             let i = shared_model(s, p)?;
@@ -394,7 +431,7 @@ fn share(s: &mut Session, p: &Value, kind: &str) -> CmdResult {
         }
     };
     let written = s.notice_mark();
-    s.notify_written(format!("Shared {name} to {path}"), false);
+    s.notify_written(format!("Shared {name} to {path}"));
     // After it, so the status bar, which shows the last notice, keeps saying it.
     note_label_classes(s, kind, p);
     note_export(s, kind, p, &path);
@@ -506,38 +543,45 @@ fn css(c: Rgba) -> String {
     format!("rgba({},{},{},{:.3})", c.r(), c.g(), c.b(), f64::from(c.a()) / 255.0)
 }
 
-/// A layer's visible features as GeoJSON, each with its drawn style.
-fn styled_features(l: &Layer, budget: &mut usize) -> Vec<Value> {
+/// A layer's visible features as GeoJSON, each with its drawn style: in longitude/latitude,
+/// whatever system the layer holds its coordinates in. One with a place that can't be given there
+/// is left out, counted in `unplaced`.
+fn styled_features(l: &Layer, budget: &mut usize, unplaced: &mut Unplaced) -> Result<Vec<Value>, String> {
     let rows = l.visible_rows();
     let opacity = 1.0 - f64::from(l.transparency.clamp(0.0, 100.0)) / 100.0;
     let mut out = Vec::new();
     // Its symbol by expression (no map scale: the page zooms on its own).
     let styler = l.styler(None);
-    for (row, ft) in l.dataset.features.iter().enumerate() {
+    let to = l.dataset.lonlat_conversion().map_err(|e| format!("{}: {e}", l.name))?;
+    for (row, ft) in l.dataset.features.rows().enumerate() {
         if *budget == 0 {
             break;
         }
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let Some(g) = &ft.geometry else { continue };
+        let Some(g) = ft.geometry() else { continue };
+        let Ok(g) = rustgis_data::Dataset::geometry_to_lonlat_by(&to, g) else {
+            unplaced.add(&l.name, 1);
+            continue;
+        };
         let sym = styler.symbol(row);
         let props: serde_json::Map<String, Value> =
             l.dataset.fields.iter().enumerate().map(|(i, f)| (f.name.clone(), json!(l.dataset.value(row, i).to_string()))).collect();
         out.push(json!({
             "type": "Feature",
-            "geometry": rustgis_data::io::geometry_to_geojson(g),
+            "geometry": rustgis_data::io::geometry_to_geojson(&g),
             "properties": props,
             "style": {"fill": css(sym.fill), "stroke": css(sym.stroke), "width": sym.stroke_width, "size": sym.size, "opacity": opacity},
         }));
         *budget -= 1;
     }
-    out
+    Ok(out)
 }
 
 /// A self-contained web map page: the map's layers (rasters as images) drawn on a canvas in Web
 /// Mercator, with pan, zoom, a layer list and pop-ups. No libraries or server.
-fn web_map_html(m: &Map, title: &str) -> Result<String, String> {
+fn web_map_html(m: &Map, title: &str, unplaced: &mut Unplaced) -> Result<String, String> {
     let mut budget = MAX_FEATURES;
     let mut pictures = 0usize;
     let mut layers = Vec::new();
@@ -571,7 +615,7 @@ fn web_map_html(m: &Map, title: &str) -> Result<String, String> {
                 json!({"name": l.name, "image": base64::engine::general_purpose::STANDARD.encode(png), "bounds": [a.x, a.y, b.x, b.y]}),
             );
         } else {
-            layers.push(json!({"name": l.name, "features": styled_features(l, &mut budget)}));
+            layers.push(json!({"name": l.name, "features": styled_features(l, &mut budget, unplaced)?}));
         }
     }
     let c = m.center_lonlat();
@@ -639,10 +683,10 @@ pub(crate) fn note_export(s: &mut Session, kind: &str, p: &Value, target: &str) 
                 )
             })
             .unwrap_or_default(),
-        _ => Vec::new(),
+        _ => Default::default(),
     };
     for note in notes {
-        s.notify(note, false);
+        s.say(note);
     }
 }
 
@@ -839,7 +883,7 @@ fn zoom_range(l: &Layer) -> (Option<f32>, Option<f32>) {
 
 /// Static OGC API – Features collections (landing page, conformance, collections and their
 /// items), plus extra files.
-fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
+fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)], unplaced: &mut Unplaced) -> Result<Vec<u8>, String> {
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut cols = Vec::new();
     let mut used: HashMap<String, usize> = HashMap::new();
@@ -854,7 +898,7 @@ fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Res
             id = format!("{base}_{}", *n + 1);
         }
         taken.insert(id.clone());
-        let e = ds.extent();
+        let e = ds.lonlat_extent();
         let mut col = json!({
             "id": id, "title": ds.name, "itemType": "feature",
             "links": [{"href": format!("collections/{id}/items.json"), "rel": "items", "type": "application/geo+json"}],
@@ -864,7 +908,11 @@ fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Res
                 json!({"spatial": {"bbox": [[e.min_x, e.min_y, e.max_x, e.max_y]], "crs": "http://www.opengis.net/def/crs/OGC/1.3/CRS84"}});
         }
         entries.push((format!("collections/{id}.json"), serde_json::to_vec_pretty(&col).map_err(|e| e.to_string())?));
-        let mut fc = rustgis_data::io::to_geojson(ds);
+        // GeoJSON is longitude/latitude, whatever system the layer holds its coordinates in; a
+        // feature with a place that can't be given there is written without its geometry.
+        let (lonlat, lost) = ds.in_lonlat_leaving_out()?;
+        unplaced.add(&ds.name, lost);
+        let mut fc = rustgis_data::io::to_geojson(&lonlat);
         fc["numberReturned"] = json!(ds.features.len());
         entries.push((format!("collections/{id}/items.json"), serde_json::to_vec(&fc).map_err(|e| e.to_string())?));
         cols.push(col);
@@ -880,9 +928,10 @@ fn ogc_zip(title: &str, layers: &[&Dataset], extra: &[(String, Vec<u8>)]) -> Res
 }
 
 /// A web layer: the layer as an OGC API Features collection, its style, and a viewer page.
-fn web_layer_zip(s: &Session, l: &Layer) -> Result<Vec<u8>, String> {
+fn web_layer_zip(s: &Session, l: &Layer, unplaced: &mut Unplaced) -> Result<Vec<u8>, String> {
     let style = serde_json::to_vec_pretty(&web_style(l)).map_err(|e| e.to_string())?;
-    let geojson = serde_json::to_vec(&rustgis_data::io::to_geojson(&l.dataset)).map_err(|e| e.to_string())?;
+    // The same features as the collection's items, counted there.
+    let geojson = serde_json::to_vec(&rustgis_data::io::to_geojson(&l.dataset.in_lonlat_leaving_out()?.0)).map_err(|e| e.to_string())?;
     let mut m = s.map().clone();
     m.layers = vec![l.clone()];
     let e = l.extent();
@@ -894,12 +943,14 @@ fn web_layer_zip(s: &Session, l: &Layer) -> Result<Vec<u8>, String> {
         m.camera.res = ((b.x - a.x).abs() / 1000.0).max((b.y - a.y).abs() / 650.0).max(1.0) * 1.1;
         m.camera.clamp();
     }
-    let html = web_map_html(&m, &l.name)?;
+    // The page's features are the same, already counted by the collection below.
+    let html = web_map_html(&m, &l.name, &mut Unplaced::default())?;
     let src = safe(&l.name);
     ogc_zip(
         &l.name,
         &[&l.dataset],
         &[("style.json".into(), style), (format!("{src}.geojson"), geojson), ("index.html".into(), html.into_bytes())],
+        unplaced,
     )
 }
 
@@ -912,7 +963,7 @@ pub struct Locator {
     pub entries: Vec<(String, f64, f64)>,
 }
 
-fn locator(l: &Layer, fields: Option<&[String]>) -> Result<Locator, String> {
+fn locator(l: &Layer, fields: Option<&[String]>, unplaced: &mut Unplaced) -> Result<Locator, String> {
     let ds = &l.dataset;
     let fis: Vec<usize> = match fields {
         Some(fs) => {
@@ -923,6 +974,7 @@ fn locator(l: &Layer, fields: Option<&[String]>) -> Result<Locator, String> {
     if fis.is_empty() {
         return Err("pick the fields to search (the layer has no text fields)".into());
     }
+    let lonlat = ds.lonlat_conversion()?;
     let mut entries = Vec::new();
     for (row, ft) in ds.features.iter().enumerate().take(MAX_FEATURES) {
         let Some(g) = &ft.geometry else { continue };
@@ -933,6 +985,13 @@ fn locator(l: &Layer, fields: Option<&[String]>) -> Result<Locator, String> {
         let c = match g {
             Geometry::Point(p) => *p,
             _ => e.center(),
+        };
+        // In longitude/latitude, the entries' system. The identity keeps the place as it is, as
+        // before; a place another system can't convert is left out, and counted, as a NaN entry
+        // would make the locator unreadable.
+        let Some(c) = (if lonlat.is_identity() { Some(c) } else { lonlat.point(c) }) else {
+            unplaced.add(&l.name, 1);
+            continue;
         };
         for &fi in &fis {
             let t = match ds.value(row, fi) {
@@ -998,6 +1057,8 @@ struct SceneBytes {
     skipped_outer: usize,
     holes_dropped: usize,
     single_vertex_lines: usize,
+    /// Features left out because a place of theirs can't be given in longitude/latitude.
+    unplaced: usize,
     /// Per layer, in scene order: its name and how many features had their base or height held
     /// to [`SCENE_TOP`].
     held: Vec<(String, usize)>,
@@ -1015,6 +1076,9 @@ impl SceneBytes {
         }
         if self.limited > 0 {
             notes.push(format!("{} feature(s) left out of the scene: the {MAX_FEATURES} feature limit was reached", self.limited));
+        }
+        if self.unplaced > 0 {
+            notes.push(format!("{} feature(s) left out of the scene: a place can't be given in longitude/latitude", self.unplaced));
         }
         if self.skipped_outer > 0 {
             notes.push(format!("Skipped {} polygon(s) whose outer ring has fewer than 3 vertices", self.skipped_outer));
@@ -1070,6 +1134,9 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
         };
         let (mut built, mut last): (usize, Option<([u8; 4], usize)>) = (0, None);
         let mut held = 0usize;
+        // The layer's conversion to longitude/latitude, made once (none: a system that can't be
+        // converted, whose features are all left out, and said).
+        let to_lonlat = l.dataset.lonlat_conversion().ok();
         for (row, ft) in l.dataset.features.iter().enumerate() {
             if let Some((k, before)) = last.take() {
                 built += size(&tri, &lines, &k).saturating_sub(before);
@@ -1082,6 +1149,13 @@ fn gltf(m: &Map, view: (f64, f64)) -> Result<SceneBytes, String> {
                 scene.limited += 1;
                 continue;
             }
+            // Placed from longitude/latitude, whatever system the layer holds its coordinates in; a
+            // feature with a place that can't be given there is left out, and said, as one too far.
+            let Some(lonlat) = to_lonlat.as_ref().and_then(|to| rustgis_data::Dataset::converted_to_lonlat(to, g)) else {
+                scene.unplaced += 1;
+                continue;
+            };
+            let g = &*lonlat;
             // A position too far for 32 bits would make the scene invalid: the feature is left out,
             // and said. Only what would be drawn counts (not a degenerate ring or a one-vertex line).
             let far = |c: &Coord| {
