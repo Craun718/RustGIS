@@ -48,6 +48,8 @@ fn layer_filter_keeps_ime_anchor_during_preedit() {
     use egui::{Event, ImeEvent};
 
     let mut h = harness();
+    // This tests IME state, not whether the host has a CJK font.
+    h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
     h.run_steps(3);
     h.get_by(|node| node.placeholder() == Some("Filter layers")).focus();
     h.run_steps(3);
@@ -75,6 +77,8 @@ fn command_search_keeps_ime_anchor_and_accepts_committed_text() {
 
     for width in [960.0, 320.0] {
         let mut h = harness_with_size(egui::vec2(width, 480.0));
+        // This tests IME state, not whether the host has a CJK font.
+        h.ctx.set_missing_glyph_policy(egui::MissingGlyphPolicy::Tofu);
         h.state_mut().run("ui.commandSearch", serde_json::Value::Null).unwrap();
         h.run_steps(4);
         let ime = h.output().platform_output.ime.unwrap();
