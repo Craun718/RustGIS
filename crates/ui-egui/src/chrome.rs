@@ -1382,7 +1382,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
     let focused = ctx.memory(|m| m.has_focus(edit_id));
     app.ui.command_search_composing &= focused;
     let escape_presses = ctx.with_plugin::<CommandSearchEscape, _>(|input| std::mem::take(&mut input.presses)).unwrap_or_default();
-    let (mut enter, mut escape, deleting_preedit, after_delete, received_preedit, ime_owns_keys) = ctx.input(|i| {
+    let (mut enter, mut escape, deleting_preedit, after_delete, ime_owns_keys) = ctx.input(|i| {
         // Raw events preserve their positions even if another widget consumed a key.
         let mut events = std::borrow::Cow::Borrowed(i.raw.events.as_slice());
         for (position, event) in escape_presses {
@@ -1395,7 +1395,6 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
         let mut escape = false;
         let mut deleting_preedit = false;
         let mut after_delete = (false, false);
-        let mut received_preedit = false;
         for event in events.iter() {
             match event {
                 egui::Event::Ime(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text))
@@ -1411,7 +1410,6 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                     app.ui.command_search_composing = false;
                 }
                 egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) if focused => {
-                    received_preedit = true;
                     deleting_preedit = false;
                     after_delete = (false, false);
                     ime_owns_frame |= app.ui.command_search_composing || !text.is_empty();
@@ -1441,6 +1439,9 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
                     deleting_preedit = false;
                     after_delete = (false, false);
                 }
+                egui::Event::Cut if app.ui.command_search_composing => {
+                    deleting_preedit = true;
+                }
                 egui::Event::Key { key: Key::Backspace | Key::Delete, pressed: true, .. } if app.ui.command_search_composing => {
                     deleting_preedit = true;
                 }
@@ -1461,7 +1462,6 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             escape && !ime_owns_frame,
             deleting_preedit,
             after_delete,
-            received_preedit,
             ime_owns_frame || app.ui.command_search_composing,
         )
     });
@@ -1508,7 +1508,7 @@ pub fn command_search(app: &mut RustGisApp, ctx: &egui::Context) {
             let edit = edit.response.response;
             // Clicking or dragging in TextEdit switches its cursor to a regular
             // selection, even when no IME event arrives to clear the preedit.
-            if !received_preedit && (edit.clicked() || edit.dragged() || (edit.hovered() && ui.input(|i| i.pointer.any_pressed()))) {
+            if edit.clicked() || edit.dragged() || (edit.hovered() && ui.input(|i| i.pointer.any_pressed())) {
                 app.ui.command_search_composing = false;
             }
             // The modal starts with an invisible sizing pass. Request focus only when

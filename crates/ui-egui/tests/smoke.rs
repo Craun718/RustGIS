@@ -320,6 +320,58 @@ fn command_search_keys_work_after_clicking_during_preedit() {
 }
 
 #[test]
+fn command_search_handles_cut_during_preedit() {
+    use egui::{Event, ImeEvent, Key};
+    for key in [Key::Enter, Key::Escape] {
+        let mut h = harness();
+        h.state_mut().run("ui.commandSearch", serde_json::Value::Null).unwrap();
+        h.run_steps(4);
+        h.event(Event::Ime(ImeEvent::Preedit { text: "buffer".into(), active_range_chars: None }));
+        h.step();
+        h.event(Event::Cut);
+        h.step();
+        assert_eq!(h.state().ui.command_search.as_deref(), Some(""));
+        h.key_press(key);
+        h.step();
+        assert!(h.state().ui.command_search.is_none(), "{key:?} should work after cut");
+    }
+    let mut h = harness();
+    h.state_mut().run("ui.commandSearch", serde_json::Value::Null).unwrap();
+    h.run_steps(4);
+    h.event(Event::Ime(ImeEvent::Preedit { text: "buffer".into(), active_range_chars: None }));
+    h.step();
+    h.key_press(Key::ArrowLeft);
+    h.step();
+    h.event(Event::Cut);
+    h.step();
+    assert_eq!(h.state().ui.command_search.as_deref(), Some("buffer"));
+    h.key_press(Key::Enter);
+    h.step();
+    assert_eq!(h.state().ui.command_search.as_deref(), Some("buffer"));
+}
+
+#[test]
+fn command_search_handles_click_and_preedit_in_same_frame() {
+    use egui::{Event, ImeEvent, Key, Modifiers, PointerButton};
+    for key in [Key::Enter, Key::Escape] {
+        let mut h = harness();
+        h.state_mut().run("ui.commandSearch", serde_json::Value::Null).unwrap();
+        h.run_steps(4);
+        let pos = h.output().platform_output.ime.unwrap().rect.center();
+        h.input_mut().events.extend([
+            Event::Ime(ImeEvent::Preedit { text: "buffer".into(), active_range_chars: None }),
+            Event::PointerMoved(pos),
+            Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE },
+            Event::PointerButton { pos, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE },
+        ]);
+        h.step();
+        h.key_press(key);
+        h.step();
+        assert!(h.state().ui.command_search.is_none(), "{key:?} should work after click");
+    }
+}
+
+#[test]
 fn command_search_runs_after_standalone_ime_commit_and_enter() {
     use egui::{ImeEvent, Key};
 
